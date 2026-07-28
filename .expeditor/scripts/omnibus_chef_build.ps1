@@ -74,15 +74,24 @@ function Get-AkeylessAccessId {
         return $env:AKEYLESS_ACCESS_ID.Trim()
     }
 
-    Write-Output "--- Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
-    $accessId = (aws ssm get-parameter `
+    Write-Host "--- Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
+    $accessIdRaw = aws ssm get-parameter `
         --name "buildkite-akeyless-access-id" `
         --with-decryption `
         --query "Parameter.Value" `
-        --output text 2>&1).Trim()
+        --output text 2>&1
 
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($accessId)) {
+    if ($LASTEXITCODE -ne 0) {
         throw "Failed to retrieve AKEYLESS_ACCESS_ID from Parameter Store"
+    }
+
+    $accessId = ($accessIdRaw | Out-String).Trim()
+    if ($accessId -match "`n") {
+        $accessId = (($accessId -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1).Trim()
+    }
+
+    if ([string]::IsNullOrWhiteSpace($accessId)) {
+        throw "Parameter buildkite-akeyless-access-id returned an empty value"
     }
 
     return $accessId
