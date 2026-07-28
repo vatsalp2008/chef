@@ -124,6 +124,20 @@ function Initialize-ProgressSigning {
     }
 
     $akeylessAccessId = Get-AkeylessAccessId
+
+    # Prevent first-run interactive profile prompts inside CI/docker jobs.
+    $env:AKEYLESS_CLI_NON_INTERACTIVE = "true"
+    $env:AKEYLESS_PROFILE = "default"
+    $akeylessHome = "$env:USERPROFILE\.akeyless"
+    New-Item -ItemType Directory -Force -Path "$akeylessHome\profiles" | Out-Null
+
+    # Best-effort non-interactive profile bootstrap for aws_iam auth.
+    # Some CLI versions require an initialized profile even when access flags are passed.
+    $configureOutput = & $akeylessExe configure --profile default --access-id $akeylessAccessId --access-type aws_iam 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Output "Akeyless configure returned non-zero; continuing with direct auth"
+    }
+
     Write-Output "--- setting up auth for akeyless"
     $authOutput = & $akeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
     if ($LASTEXITCODE -ne 0) {
