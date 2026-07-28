@@ -130,12 +130,45 @@ function Initialize-ProgressSigning {
         throw "Akeyless auth failed"
     }
 
-    $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
-    if (-not $tokenMatch) {
-        throw "Could not parse token from Akeyless auth output"
+    $authText = ($authOutput | Out-String).Trim()
+    $akeylessToken = $null
+
+    # Newer/older akeyless CLI builds can emit either JSON or plain text.
+    try {
+        $authObj = $authText | ConvertFrom-Json -ErrorAction Stop
+        if (-not [string]::IsNullOrWhiteSpace($authObj.token)) {
+            $akeylessToken = $authObj.token.Trim()
+        }
+    }
+    catch {
+        # Non-JSON output, continue with regex parsing.
     }
 
-    $akeylessToken = $tokenMatch.Matches[0].Groups[1].Value
+    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
+        $tokenMatch = [regex]::Match($authText, '(?im)^\s*token\s*[:=]\s*([^\s"'']+)')
+        if ($tokenMatch.Success) {
+            $akeylessToken = $tokenMatch.Groups[1].Value.Trim()
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
+        $jsonTokenMatch = [regex]::Match($authText, '"token"\s*:\s*"([^"]+)"')
+        if ($jsonTokenMatch.Success) {
+            $akeylessToken = $jsonTokenMatch.Groups[1].Value.Trim()
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
+        $lastLine = ($authText -split "`r?`n" | Select-Object -Last 1).Trim()
+        if ($lastLine -match '^[A-Za-z0-9._=-]{20,}$') {
+            $akeylessToken = $lastLine
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
+        $preview = ($authText -split "`r?`n" | Select-Object -First 5) -join " | "
+        throw "Could not parse token from Akeyless auth output. Preview: $preview"
+    }
     $dsJson = & $akeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to fetch EV code signing dynamic secret"
