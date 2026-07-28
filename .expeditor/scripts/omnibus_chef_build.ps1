@@ -19,8 +19,8 @@ $DefaultKeypairAlias = "key_1340572417"
 function Initialize-Environment {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]
-        [string]$ThumbprintValue
+        [Parameter(Mandatory = $false)]
+        [string]$ThumbprintValue = ""
     )
     
     try {
@@ -32,7 +32,9 @@ function Initialize-Environment {
         
         $env:PROJECT_NAME = "chef"
         $env:OMNIBUS_PIPELINE_DEFINITION_PATH = "${ScriptDir}/../release.omnibus.yml"
-        $env:OMNIBUS_SIGNING_IDENTITY = "${ThumbprintValue}"
+        if (-not [string]::IsNullOrWhiteSpace($ThumbprintValue)) {
+            $env:OMNIBUS_SIGNING_IDENTITY = "${ThumbprintValue}"
+        }
         $env:HOMEDRIVE = "C:"
         $env:HOMEPATH = "\Users\ContainerAdministrator"
         $env:OMNIBUS_TOOLCHAIN_INSTALL_DIR = "C:\opscode\omnibus-toolchain"
@@ -61,6 +63,110 @@ function Initialize-Environment {
     catch {
         Write-Error "Failed to initialize environment: $_"
         exit 1
+    }
+}
+
+function Get-AkeylessAccessId {
+    [CmdletBinding()]
+    param()
+
+    if (-not [string]::IsNullOrWhiteSpace($env:AKEYLESS_ACCESS_ID)) {
+        return $env:AKEYLESS_ACCESS_ID.Trim()
+    }
+
+    Write-Output "--- Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
+    $accessId = (aws ssm get-parameter `
+        --name "buildkite-akeyless-access-id" `
+        --with-decryption `
+        --query "Parameter.Value" `
+        --output text 2>&1).Trim()
+
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($accessId)) {
+        throw "Failed to retrieve AKEYLESS_ACCESS_ID from Parameter Store"
+    }
+
+    return $accessId
+}
+
+function Initialize-ProgressSigning {
+    [CmdletBinding()]
+    param()
+
+    Write-Output "--- Initializing Progress EV code signing credentials"
+
+    $localBin = "$env:USERPROFILE\.local\bin"
+    New-Item -Path $localBin -ItemType Directory -Force | Out-Null
+    $env:PATH = "$localBin;$env:PATH"
+    $akeylessExe = "$localBin\akeyless.exe"
+    $dotnetDir = "$env:USERPROFILE\.dotnet"
+    $env:DOTNET_ROOT = $dotnetDir
+    $env:PATH = "$dotnetDir\tools;$dotnetDir;$env:PATH"
+
+    if (-not (Test-Path $akeylessExe)) {
+        Invoke-WebRequest -Uri "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe" -OutFile $akeylessExe -UseBasicParsing
+    }
+
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        $dotnetInstallScript = "$env:TEMP\dotnet-install.ps1"
+        Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile $dotnetInstallScript -UseBasicParsing
+        & $dotnetInstallScript -Channel 8.0 -InstallDir $dotnetDir
+    }
+
+    if (-not (Get-Command sign -ErrorAction SilentlyContinue)) {
+        dotnet tool install --global sign --prerelease
+    }
+
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        $azCliMsi = "$env:TEMP\azure-cli.msi"
+        Invoke-WebRequest -Uri "https://aka.ms/installazurecliwindows" -OutFile $azCliMsi -UseBasicParsing
+        Start-Process msiexec.exe -Wait -ArgumentList "/I $azCliMsi /quiet /norestart"
+        $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
+    }
+
+    $akeylessAccessId = Get-AkeylessAccessId
+    Write-Output "--- setting up auth for akeyless"
+    $authOutput = & $akeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Akeyless auth failed"
+    }
+
+    $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
+    if (-not $tokenMatch) {
+        throw "Could not parse token from Akeyless auth output"
+    }
+
+    $akeylessToken = $tokenMatch.Matches[0].Groups[1].Value
+    $dsJson = & $akeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to fetch EV code signing dynamic secret"
+    }
+
+    $ds = ($dsJson | ConvertFrom-Json).secret
+    if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or [string]::IsNullOrWhiteSpace($ds.appId) -or [string]::IsNullOrWhiteSpace($ds.secretText)) {
+        throw "Dynamic secret response is missing required Azure fields"
+    }
+
+    $env:AZURE_TENANT_ID = $ds.tenantId
+    $env:AZURE_CLIENT_ID = $ds.appId
+    $env:AZURE_CLIENT_SECRET = $ds.secretText
+    $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
+    $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
+
+    if (Get-Command az -ErrorAction SilentlyContinue) {
+        $loginOk = $false
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            az login --service-principal --username $env:AZURE_CLIENT_ID --password $env:AZURE_CLIENT_SECRET --tenant $env:AZURE_TENANT_ID --output none 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $loginOk = $true
+                break
+            }
+            if ($attempt -lt 5) {
+                Start-Sleep -Seconds 15
+            }
+        }
+        if (-not $loginOk) {
+            throw "az login failed after retries"
+        }
     }
 }
 
@@ -507,13 +613,22 @@ function Cleanup-SmctlCredentials {
     param()
     
     try {
-        Write-Output "--- smctl credentials delete just to clean up"
-        smctl windows certdesync
-        if ( -not $? ) { throw "Failed to clean up smctl credentials" }
-        
+        if (Get-Command smctl -ErrorAction SilentlyContinue) {
+            Write-Output "--- smctl credentials delete just to clean up"
+            smctl windows certdesync
+        }
+
+        if (Get-Command az -ErrorAction SilentlyContinue) {
+            Write-Output "--- Azure logout"
+            az logout 2>&1 | Out-Null
+        }
+
+        Remove-Item Env:AZURE_TENANT_ID -ErrorAction SilentlyContinue
+        Remove-Item Env:AZURE_CLIENT_ID -ErrorAction SilentlyContinue
+        Remove-Item Env:AZURE_CLIENT_SECRET -ErrorAction SilentlyContinue
     }
     catch {
-        Write-Error "Failed to clean up smctl credentials: $_"
+        Write-Error "Failed to clean up signing credentials: $_"
         # Not exiting with code 1 as this is a cleanup step
         Write-Warning "Continuing despite credential cleanup failure"
     }
@@ -563,23 +678,15 @@ try {
     # Determine certificate to use based on organization
     if ($env:BUILDKITE_ORGANIZATION_SLUG -eq "chef-oss") {
         $thumbprint = Set-SelfSignedCertificate
+        $thumbprint = $thumbprint.Trim()
+        Write-Output "THUMB=$thumbprint"
+        Initialize-Environment -ThumbprintValue $thumbprint
     }
     else {
-        # DigiCert setup
-        Get-SmctlCertificate
-        Set-SmctlCredentials
-        Register-SmctlCertificates
-        $thumbprint = Get-Certificate
+        Initialize-ProgressSigning
+        Initialize-Environment
     }
-    
-    # Make sure thumbprint is a clean string
-    $thumbprint = $thumbprint.Trim()
-    
-    Write-Output "THUMB=$thumbprint"
-    
-    # Set up the build environment
-    Initialize-Environment -ThumbprintValue $thumbprint
-    Smctl-Debug
+
     Install-ChefFoundation
     Install-OmnibusDependencies
     
