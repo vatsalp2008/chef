@@ -132,23 +132,35 @@ function Initialize-ProgressSigning {
         $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
     }
 
+    # Ensure AWS credentials are active before proceeding with Akeyless AWS IAM auth
+    Write-Output "--- Verifying AWS STS identity for Akeyless IAM authentication"
+    aws sts get-caller-identity 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "AWS credentials have expired or are missing. Cannot authenticate with Akeyless via aws_iam."
+    }
+
     $akeylessAccessId = Get-AkeylessAccessId
 
     # Prevent first-run interactive profile prompts inside CI/docker jobs.
     $env:AKEYLESS_CLI_NON_INTERACTIVE = "true"
     $env:AKEYLESS_PROFILE = "default"
+
+    # Explicitly set the Akeyless API Gateway URL to prevent malformed endpoint errors
+    if ([string]::IsNullOrWhiteSpace($env:AKEYLESS_URL)) {
+        $env:AKEYLESS_URL = "https://api.akeyless.io"
+    }
+
     $akeylessHome = "$env:USERPROFILE\.akeyless"
     New-Item -ItemType Directory -Force -Path "$akeylessHome\profiles" | Out-Null
 
     # Best-effort non-interactive profile bootstrap for aws_iam auth.
-    # Some CLI versions require an initialized profile even when access flags are passed.
-    $configureOutput = & $akeylessExe configure --profile default --access-id $akeylessAccessId --access-type aws_iam 2>&1
+    $configureOutput = & $akeylessExe configure --profile default --access-id $akeylessAccessId --access-type aws_iam --url $env:AKEYLESS_URL 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-Output "Akeyless configure returned non-zero; continuing with direct auth"
     }
 
     Write-Output "--- setting up auth for akeyless"
-    $authOutput = & $akeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
+    $authOutput = & $akeylessExe auth --access-id $akeylessAccessId --access-type aws_iam --url $env:AKEYLESS_URL 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Akeyless auth failed"
     }
@@ -192,7 +204,7 @@ function Initialize-ProgressSigning {
         $preview = ($authText -split "`r?`n" | Select-Object -First 5) -join " | "
         throw "Could not parse token from Akeyless auth output. Preview: $preview"
     }
-    $dsJson = & $akeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken 2>&1
+    $dsJson = & $akeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken --url $env:AKEYLESS_URL 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to fetch EV code signing dynamic secret"
     }
@@ -341,7 +353,7 @@ function Register-SmctlCertificates {
             
             Write-Output "--- smksp_registrar sync certs before chef install"
             smksp_registrar.exe register
-            if ( -not $? ) { throw "Failed to register certificates" }
+            if ( -not $? ) { throw "Failed to register certificates"
     
             $keypairAlias = if (-not [string]::IsNullOrWhiteSpace($env:key_pair_alias)) {
                 $env:key_pair_alias.Trim()
@@ -501,19 +513,11 @@ function Install-OmnibusDependencies {
         # Clear GITHUB_TOKEN from the environment immediately after use
         Remove-Item Env:\GITHUB_TOKEN -ErrorAction SilentlyContinue
 
-        # Configure Git for Windows Docker environment
-        # git config --global core.longpaths true
-        # git config --global http.sslbackend schannel
-        # git config --global http.timeout 600
-        # git config --global http.postBuffer 524288000
-        # git config --global user.email "buildkite@chef.io"
-        # git config --global user.name "Buildkite CI"
-
-        # Set Bundler configuration for better reliability
+        # Configure Bundler for better reliability
         Write-Output "--- Configuring Bundler for private repositories"
         bundle config set --local without development
 
-        # # Navigate to omnibus directory
+        # Navigate to omnibus directory
         Set-Location "$($ScriptDir)/../../omnibus"
         Write-Output "--- Running bundle install for Omnibus"
         bundle install
@@ -608,7 +612,6 @@ function Verify-SignedPackage {
     $errorMessage = ""
     
     try {
-        # Fix: Add the missing 'chef' subdirectory to the path
         $directoryPath = "C:\omnibus-ruby\chef\pkg\"
         $msiFile = Get-ChildItem -Path $directoryPath -Filter *.msi | Select-Object -First 1
         if ( -not $? ) { throw "Failed to list MSI files" }
@@ -617,10 +620,9 @@ function Verify-SignedPackage {
         
         # Check if an .msi file was found
         if ($msiFile -ne $null) {
-            # Display the full path of the found .msi file
             $fullPath = $msiFile.FullName
             Write-Output "Found .msi file: $fullPath"
-            # check with signtool for additional verification
+            
             Write-Output "--- verify signed file using signtool"
             $signToolOutput = signtool verify /pa $fullPath 2>&1 | Out-String
             
@@ -642,7 +644,6 @@ function Verify-SignedPackage {
         $errorMessage = "Package verification failed: $_"
     }
     
-    # Always attempt to display logs regardless of verification result
     try {
         if ($env:DEBUGSMCTL -eq $true) {
             Write-Output "--- grabbing smctl logs"
@@ -657,7 +658,6 @@ function Verify-SignedPackage {
         Write-Error "--- All smctl logs not found, please check smctl configuration"
     }
     
-    # Now handle the verification failure if it occurred
     if ($verificationFailed) {
         Write-Error $errorMessage
         exit 1
@@ -685,7 +685,6 @@ function Cleanup-SmctlCredentials {
     }
     catch {
         Write-Error "Failed to clean up signing credentials: $_"
-        # Not exiting with code 1 as this is a cleanup step
         Write-Warning "Continuing despite credential cleanup failure"
     }
 }
@@ -696,7 +695,6 @@ function Upload-BuildkiteArtifact {
     
     try {
         Write-Output "--- Uploading package to BuildKite"
-        # Fix: Use the correct path where omnibus actually creates the MSI
         C:\buildkite-agent\bin\buildkite-agent.exe artifact upload "C:\omnibus-ruby\chef\pkg\*.msi*" 
         if ( -not $? ) { throw "Failed to upload artifact to BuildKite" }
     }
@@ -731,7 +729,6 @@ function Publish-ToArtifactory {
 
 # Main execution block
 try {
-    # Determine certificate to use based on organization
     if ($env:BUILDKITE_ORGANIZATION_SLUG -eq "chef-oss") {
         $thumbprint = Set-SelfSignedCertificate
         $thumbprint = $thumbprint.Trim()
@@ -746,11 +743,9 @@ try {
     Install-ChefFoundation
     Install-OmnibusDependencies
     
-    # Build and verify package
     Build-ChefPackage
     Verify-SignedPackage
     
-    # Cleanup and publish
     Cleanup-SmctlCredentials
     Upload-BuildkiteArtifact
     Publish-ToArtifactory
