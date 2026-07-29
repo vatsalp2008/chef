@@ -353,7 +353,7 @@ function Register-SmctlCertificates {
             
             Write-Output "--- smksp_registrar sync certs before chef install"
             smksp_registrar.exe register
-            if ( -not $? ) { throw "Failed to register certificates"
+            if ( -not $? ) { throw "Failed to register certificates" }
     
             $keypairAlias = if (-not [string]::IsNullOrWhiteSpace($env:key_pair_alias)) {
                 $env:key_pair_alias.Trim()
