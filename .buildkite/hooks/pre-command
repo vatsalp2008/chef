@@ -188,9 +188,11 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-.* ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG"
     echo "GITHUB_TOKEN set for private repository access"
 fi
 # Initialize Progress EV code signing credentials for Windows builds (Bash version)
-# This runs on the host where DNS resolution works; credentials passed to Docker container
+# Writes to file so omnibus-buildkite-plugin can pass to Docker
 if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG" =~ chef(-canary)?$ ]]; then
   echo "--- Initializing Progress EV code signing credentials (bash)"
+  
+  AZURE_ENV_FILE=".buildkite-azure-env"
   
   # Fetch Akeyless access ID from AWS Parameter Store
   AKEYLESS_ACCESS_ID=$(aws ssm get-parameter \
@@ -203,11 +205,11 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
     exit 1
   }
   
-  export AKEYLESS_ACCESS_ID
-  
   # Check if akeyless CLI is available
   if ! command -v akeyless &> /dev/null; then
     echo "Akeyless CLI not found; will initialize in Docker container"
+    # Write sentinel so omnibus knows pre-command ran
+    echo "export BUILDKITE_PRECOMMAND_RAN=true" > "$AZURE_ENV_FILE"
     exit 0
   fi
   
@@ -246,12 +248,22 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
     exit 1
   fi
   
-  # Export Azure credentials for omnibus build (will be passed to Docker container)
+  # Write Azure credentials to file for omnibus-buildkite-plugin to pick up
+  cat > "$AZURE_ENV_FILE" << 'EOF_AZURE'
+export AZURE_TENANT_ID="$AZURE_TENANT_ID"
+export AZURE_CLIENT_ID="$AZURE_CLIENT_ID"
+export AZURE_CLIENT_SECRET="$AZURE_CLIENT_SECRET"
+export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
+export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
+EOF_AZURE
+  
+  # Also export for current session
   export AZURE_TENANT_ID
   export AZURE_CLIENT_ID
   export AZURE_CLIENT_SECRET
   export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
   export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
   
-  echo "Progress EV code signing credentials initialized"
+  echo "Progress EV code signing credentials written to $AZURE_ENV_FILE and exported"
 fi
+
