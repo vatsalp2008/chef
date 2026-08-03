@@ -192,6 +192,11 @@ fi
 # This runs on the host where DNS resolution works; credentials passed to Docker container
 if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG" =~ chef(-canary)?$ ]]; then
   echo "--- Initializing Progress EV code signing credentials"
+  # Only run on Windows agents where PowerShell is available
+  if ! command -v pwsh &> /dev/null; then
+    echo "PowerShell not available; skipping Progress EV signing (will be initialized in Docker container)"
+    exit 0
+  fi
   if ! pwsh -NoProfile -File - <<'PWSH'
 $ErrorActionPreference = "Stop"
 
