@@ -191,133 +191,132 @@ fi
 # Initialize Progress EV code signing credentials for Windows builds (before Docker container starts)
 # This runs on the host where DNS resolution works; credentials passed to Docker container
 if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG" =~ chef(-canary)?$ ]]; then
-    echo "--- Initializing Progress EV code signing credentials"
-    pwsh -NoProfile -Command {
-        $ErrorActionPreference = "Stop"
-        
-        # Function to fetch access ID from Parameter Store
-        function Get-AkeylessAccessId {
-            if (-not [string]::IsNullOrWhiteSpace($env:AKEYLESS_ACCESS_ID)) {
-                return $env:AKEYLESS_ACCESS_ID.Trim()
-            }
-            
-            Write-Host "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
-            $accessId = (aws ssm get-parameter `
-                --name "buildkite-akeyless-access-id" `
-                --with-decryption `
-                --query "Parameter.Value" `
-                --output text).Trim()
-            
-            if ([string]::IsNullOrWhiteSpace($accessId)) {
-                throw "Parameter Store returned empty value for buildkite-akeyless-access-id"
-            }
-            return $accessId
+  echo "--- Initializing Progress EV code signing credentials"
+  if ! pwsh -NoProfile -File - <<'PWSH'
+$ErrorActionPreference = "Stop"
+
+# Function to fetch access ID from Parameter Store
+function Get-AkeylessAccessId {
+    if (-not [string]::IsNullOrWhiteSpace($env:AKEYLESS_ACCESS_ID)) {
+        return $env:AKEYLESS_ACCESS_ID.Trim()
+    }
+    
+    Write-Host "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
+    $accessId = (aws ssm get-parameter `
+        --name "buildkite-akeyless-access-id" `
+        --with-decryption `
+        --query "Parameter.Value" `
+        --output text).Trim()
+    
+    if ([string]::IsNullOrWhiteSpace($accessId)) {
+        throw "Parameter Store returned empty value for buildkite-akeyless-access-id"
+    }
+    return $accessId
+}
+
+try {
+    # Verify AWS credentials
+    aws sts get-caller-identity 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "AWS credentials missing or expired"
+    }
+    
+    # Get Akeyless access ID
+    $akeylessAccessId = Get-AkeylessAccessId
+    
+    # Ensure akeyless CLI is available
+    $akeylessExe = "$env:USERPROFILE\.local\bin\akeyless.exe"
+    if (-not (Test-Path $akeylessExe)) {
+        New-Item -Path (Split-Path $akeylessExe) -ItemType Directory -Force | Out-Null
+        Write-Host "Downloading Akeyless CLI"
+        Invoke-WebRequest -Uri "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe" `
+            -OutFile $akeylessExe -UseBasicParsing
+    }
+    
+    # Set Akeyless environment
+    $env:AKEYLESS_CLI_NON_INTERACTIVE = "true"
+    $env:AKEYLESS_PROFILE = "default"
+    if ([string]::IsNullOrWhiteSpace($env:AKEYLESS_URL)) {
+        $env:AKEYLESS_URL = "https://api.akeyless.io"
+    }
+    
+    # Create akeyless profile directory
+    $akeylessHome = "$env:USERPROFILE\.akeyless"
+    New-Item -ItemType Directory -Force -Path "$akeylessHome\profiles" | Out-Null
+    
+    # Configure and authenticate to Akeyless
+    Write-Host "Configuring Akeyless AWS IAM authentication"
+    & $akeylessExe configure --profile default --access-id $akeylessAccessId `
+        --access-type aws_iam --url $env:AKEYLESS_URL 2>&1 | Out-Null
+    
+    Write-Host "Authenticating to Akeyless"
+    $authOutput = (& $akeylessExe auth --access-id $akeylessAccessId `
+        --access-type aws_iam --url $env:AKEYLESS_URL 2>&1 | Out-String).Trim()
+    
+    if ($LASTEXITCODE -ne 0) {
+        throw "Akeyless authentication failed: $authOutput"
+    }
+    
+    # Parse token from auth output (handles JSON and plain text formats)
+    $akeylessToken = $null
+    try {
+        $authObj = $authOutput | ConvertFrom-Json -ErrorAction Stop
+        if (-not [string]::IsNullOrWhiteSpace($authObj.token)) {
+            $akeylessToken = $authObj.token.Trim()
         }
-        
-        try {
-            # Verify AWS credentials
-            aws sts get-caller-identity 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-                throw "AWS credentials missing or expired"
-            }
-            
-            # Get Akeyless access ID
-            $akeylessAccessId = Get-AkeylessAccessId
-            
-            # Ensure akeyless CLI is available
-            $akeylessExe = "$env:USERPROFILE\.local\bin\akeyless.exe"
-            if (-not (Test-Path $akeylessExe)) {
-                New-Item -Path (Split-Path $akeylessExe) -ItemType Directory -Force | Out-Null
-                Write-Host "Downloading Akeyless CLI"
-                Invoke-WebRequest -Uri "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe" `
-                    -OutFile $akeylessExe -UseBasicParsing
-            }
-            
-            # Set Akeyless environment
-            $env:AKEYLESS_CLI_NON_INTERACTIVE = "true"
-            $env:AKEYLESS_PROFILE = "default"
-            if ([string]::IsNullOrWhiteSpace($env:AKEYLESS_URL)) {
-                $env:AKEYLESS_URL = "https://api.akeyless.io"
-            }
-            
-            # Create akeyless profile directory
-            $akeylessHome = "$env:USERPROFILE\.akeyless"
-            New-Item -ItemType Directory -Force -Path "$akeylessHome\profiles" | Out-Null
-            
-            # Configure and authenticate to Akeyless
-            Write-Host "Configuring Akeyless AWS IAM authentication"
-            & $akeylessExe configure --profile default --access-id $akeylessAccessId `
-                --access-type aws_iam --url $env:AKEYLESS_URL 2>&1 | Out-Null
-            
-            Write-Host "Authenticating to Akeyless"
-            $authOutput = (& $akeylessExe auth --access-id $akeylessAccessId `
-                --access-type aws_iam --url $env:AKEYLESS_URL 2>&1 | Out-String).Trim()
-            
-            if ($LASTEXITCODE -ne 0) {
-                throw "Akeyless authentication failed: $authOutput"
-            }
-            
-            # Parse token from auth output (handles JSON and plain text formats)
-            $akeylessToken = $null
-            try {
-                $authObj = $authOutput | ConvertFrom-Json -ErrorAction Stop
-                if (-not [string]::IsNullOrWhiteSpace($authObj.token)) {
-                    $akeylessToken = $authObj.token.Trim()
-                }
-            } catch {
-                # Try regex pattern
-                if ($authOutput -match '"token"\s*:\s*"([^"]+)"') {
-                    $akeylessToken = $matches[1]
-                }
-                elseif ($authOutput -match '\btoken\s*[:=]\s*([^\s"'']+)') {
-                    $akeylessToken = $matches[1]
-                }
-                else {
-                    $lastLine = (($authOutput -split "`r?`n") | Select-Object -Last 1).Trim()
-                    if ($lastLine -match '^[A-Za-z0-9._=-]{20,}$') {
-                        $akeylessToken = $lastLine
-                    }
-                }
-            }
-            
-            if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
-                throw "Could not parse token from Akeyless auth output"
-            }
-            
-            # Fetch EV code signing dynamic secret
-            Write-Host "Fetching EV code signing credentials from Akeyless"
-            $dsJson = (& $akeylessExe dynamic-secret get-value `
-                --name "/DevOps/EvCodeSign/evcodesignservice" `
-                --token $akeylessToken `
-                --url $env:AKEYLESS_URL 2>&1 | Out-String).Trim()
-            
-            if ($LASTEXITCODE -ne 0) {
-                throw "Failed to fetch dynamic secret: $dsJson"
-            }
-            
-            $ds = ($dsJson | ConvertFrom-Json).secret
-            if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or [string]::IsNullOrWhiteSpace($ds.appId) -or [string]::IsNullOrWhiteSpace($ds.secretText)) {
-                throw "Dynamic secret missing required Azure fields"
-            }
-            
-            # Export Azure credentials for omnibus build (will be passed to Docker container)
-            Write-Host "Setting Azure credentials for code signing"
-            [System.Environment]::SetEnvironmentVariable("AZURE_TENANT_ID", $ds.tenantId, "Process")
-            [System.Environment]::SetEnvironmentVariable("AZURE_CLIENT_ID", $ds.appId, "Process")
-            [System.Environment]::SetEnvironmentVariable("AZURE_CLIENT_SECRET", $ds.secretText, "Process")
-            [System.Environment]::SetEnvironmentVariable("OMNIBUS_AZURE_KEY_VAULT_URL", "https://caps-evcodesign-useast.vault.azure.net", "Process")
-            [System.Environment]::SetEnvironmentVariable("OMNIBUS_AZURE_CERT_NAME", "psc-evcodesign", "Process")
-            
-            Write-Host "Progress EV code signing credentials initialized"
+    } catch {
+        # Try regex pattern
+        if ($authOutput -match '"token"\s*:\s*"([^"]+)"') {
+            $akeylessToken = $matches[1]
         }
-        catch {
-            Write-Error "Failed to initialize Progress EV code signing: $_"
-            exit 1
+        elseif ($authOutput -match '\btoken\s*[:=]\s*([^\s"'']+)') {
+            $akeylessToken = $matches[1]
+        }
+        else {
+            $lastLine = (($authOutput -split "`r?`n") | Select-Object -Last 1).Trim()
+            if ($lastLine -match '^[A-Za-z0-9._=-]{20,}$') {
+                $akeylessToken = $lastLine
+            }
         }
     }
     
-    if [ $? -ne 0 ]; then
-        echo "Progress EV signing initialization failed"
-        exit 1
-    fi
+    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
+        throw "Could not parse token from Akeyless auth output"
+    }
+    
+    # Fetch EV code signing dynamic secret
+    Write-Host "Fetching EV code signing credentials from Akeyless"
+    $dsJson = (& $akeylessExe dynamic-secret get-value `
+        --name "/DevOps/EvCodeSign/evcodesignservice" `
+        --token $akeylessToken `
+        --url $env:AKEYLESS_URL 2>&1 | Out-String).Trim()
+    
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to fetch dynamic secret: $dsJson"
+    }
+    
+    $ds = ($dsJson | ConvertFrom-Json).secret
+    if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or [string]::IsNullOrWhiteSpace($ds.appId) -or [string]::IsNullOrWhiteSpace($ds.secretText)) {
+        throw "Dynamic secret missing required Azure fields"
+    }
+    
+    # Export Azure credentials for omnibus build (will be passed to Docker container)
+    Write-Host "Setting Azure credentials for code signing"
+    [System.Environment]::SetEnvironmentVariable("AZURE_TENANT_ID", $ds.tenantId, "Process")
+    [System.Environment]::SetEnvironmentVariable("AZURE_CLIENT_ID", $ds.appId, "Process")
+    [System.Environment]::SetEnvironmentVariable("AZURE_CLIENT_SECRET", $ds.secretText, "Process")
+    [System.Environment]::SetEnvironmentVariable("OMNIBUS_AZURE_KEY_VAULT_URL", "https://caps-evcodesign-useast.vault.azure.net", "Process")
+    [System.Environment]::SetEnvironmentVariable("OMNIBUS_AZURE_CERT_NAME", "psc-evcodesign", "Process")
+    
+    Write-Host "Progress EV code signing credentials initialized"
+}
+catch {
+    Write-Error "Failed to initialize Progress EV code signing: $_"
+    exit 1
+}
+PWSH
+  then
+    echo "Progress EV signing initialization failed"
+    exit 1
+  fi
 fi
