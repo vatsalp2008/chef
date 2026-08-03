@@ -187,3 +187,71 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-.* ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG"
     
     echo "GITHUB_TOKEN set for private repository access"
 fi
+# Initialize Progress EV code signing credentials for Windows builds (Bash version)
+# This runs on the host where DNS resolution works; credentials passed to Docker container
+if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG" =~ chef(-canary)?$ ]]; then
+  echo "--- Initializing Progress EV code signing credentials (bash)"
+  
+  # Fetch Akeyless access ID from AWS Parameter Store
+  AKEYLESS_ACCESS_ID=$(aws ssm get-parameter \
+    --name "buildkite-akeyless-access-id" \
+    --with-decryption \
+    --query "Parameter.Value" \
+    --output text \
+    --region "${AWS_REGION}") || {
+    echo "Failed to fetch Akeyless access ID from Parameter Store"
+    exit 1
+  }
+  
+  export AKEYLESS_ACCESS_ID
+  
+  # Check if akeyless CLI is available
+  if ! command -v akeyless &> /dev/null; then
+    echo "Akeyless CLI not found; will initialize in Docker container"
+    exit 0
+  fi
+  
+  # Authenticate to Akeyless and retrieve dynamic secret
+  echo "Authenticating to Akeyless"
+  AKEYLESS_TOKEN=$(akeyless auth \
+    --access-id "$AKEYLESS_ACCESS_ID" \
+    --access-type aws_iam \
+    --url https://api.akeyless.io 2>/dev/null | jq -r '.token // .access_token // .' | head -1) || {
+    echo "Akeyless authentication failed"
+    exit 1
+  }
+  
+  if [[ -z "$AKEYLESS_TOKEN" ]]; then
+    echo "Failed to get Akeyless token"
+    exit 1
+  fi
+  
+  # Fetch EV code signing dynamic secret
+  echo "Fetching EV code signing credentials from Akeyless"
+  DYNAMIC_SECRET=$(akeyless dynamic-secret get-value \
+    --name "/DevOps/EvCodeSign/evcodesignservice" \
+    --token "$AKEYLESS_TOKEN" \
+    --url https://api.akeyless.io 2>/dev/null) || {
+    echo "Failed to fetch dynamic secret"
+    exit 1
+  }
+  
+  # Extract Azure credentials from dynamic secret
+  AZURE_TENANT_ID=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.tenantId // empty')
+  AZURE_CLIENT_ID=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.appId // empty')
+  AZURE_CLIENT_SECRET=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.secretText // empty')
+  
+  if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
+    echo "Dynamic secret missing required Azure fields"
+    exit 1
+  fi
+  
+  # Export Azure credentials for omnibus build (will be passed to Docker container)
+  export AZURE_TENANT_ID
+  export AZURE_CLIENT_ID
+  export AZURE_CLIENT_SECRET
+  export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
+  export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
+  
+  echo "Progress EV code signing credentials initialized"
+fi
