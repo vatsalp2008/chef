@@ -92,12 +92,19 @@ function Initialize-ProgressSigning {
         Invoke-WebRequest -Uri $AkeylessUrl -OutFile $AkeylessExe -UseBasicParsing
     }
 
-    # Fetch access ID from Parameter Store
+    # Fetch access ID (should be pre-fetched and passed by omnibus-buildkite-plugin on host)
     $akeylessAccessId = if ($env:AKEYLESS_ACCESS_ID) {
+        Write-Output "Using pre-set AKEYLESS_ACCESS_ID (from omnibus-buildkite-plugin)"
         $env:AKEYLESS_ACCESS_ID.Trim()
     } else {
-        Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
-        (aws ssm get-parameter --name "buildkite-akeyless-access-id" --with-decryption --query "Parameter.Value" --output text).Trim()
+        # Fallback: Try to fetch from Parameter Store (requires AWS CLI in container)
+        Write-Output "AKEYLESS_ACCESS_ID not pre-set; attempting to fetch from AWS Parameter Store"
+        $awsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
+        $accessId = (aws ssm get-parameter --name "buildkite-akeyless-access-id" --with-decryption --region $awsRegion --query "Parameter.Value" --output text 2>&1).Trim()
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($accessId)) {
+            throw "Failed to fetch AKEYLESS_ACCESS_ID: AWS CLI may not be available in container or credentials missing. Ensure AKEYLESS_ACCESS_ID is pre-set by omnibus-buildkite-plugin."
+        }
+        $accessId
     }
     
     if ([string]::IsNullOrWhiteSpace($akeylessAccessId)) {
