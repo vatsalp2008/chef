@@ -75,7 +75,7 @@ function Initialize-ProgressSigning {
     $dotnetSignVersion = "0.9.1-beta.26371.2"
     if (-not (Get-Command dotnet-sign -ErrorAction SilentlyContinue)) {
         Write-Output "Installing dotnet sign tool v$dotnetSignVersion"
-        dotnet tool install -g dotnet-sign --version $dotnetSignVersion --prerelease
+        dotnet tool install -g dotnet-sign --version $dotnetSignVersion
         if ($LASTEXITCODE -ne 0) {
             Write-Error "Failed to install dotnet sign tool"
             exit 1
