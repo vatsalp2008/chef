@@ -1,15 +1,7 @@
 #Requires -Version 5.1
+# Chef omnibus build with Progress EV code signing via Azure Key Vault
+# Mirrors chef-installer-scripts windows-sign.ps1 flow for Chef-18 builds
 
-# 
-# To enable extra debug messages in the build output, set the environment variable DEBUGSMCTL to true before running the script.
-# on the buildkite pipeline env options: DEBUGSMCTL="true" 
-# 
-
-
-[CmdletBinding()]
-param()
-
-# Global variables and script-wide error handling
 $ErrorActionPreference = "Stop"
 
 # Source build-settings from omnibus-buildkite-plugin if available (contains AZURE_* vars)
@@ -18,17 +10,21 @@ if (Test-Path $buildSettingsPath) {
     Write-Output "Sourcing build-settings from omnibus-buildkite-plugin"
     . $buildSettingsPath
 }
-$ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
-$DefaultSigningThumbprint = "EEB3EC48AA807336AA732AC9B310131DFAA034D1"
-$DefaultKeypairAlias = "key_1340572417"
 
-# Function definitions
+$ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
+
+# Tool paths
+$LocalBin = "$env:USERPROFILE\.local\bin"
+New-Item -Path $LocalBin -ItemType Directory -Force | Out-Null
+$env:PATH = "$LocalBin;$env:PATH"
+$AkeylessExe = "$LocalBin\akeyless.exe"
+$DotnetDir = "$env:USERPROFILE\.dotnet"
+$env:DOTNET_ROOT = $DotnetDir
+$env:PATH = "$DotnetDir\tools;$DotnetDir;$env:PATH"
+
 function Initialize-Environment {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $false)]
-        [string]$ThumbprintValue = ""
-    )
+    param()
     
     try {
         Write-Output "Setting up environment variables"
@@ -39,9 +35,6 @@ function Initialize-Environment {
         
         $env:PROJECT_NAME = "chef"
         $env:OMNIBUS_PIPELINE_DEFINITION_PATH = "${ScriptDir}/../release.omnibus.yml"
-        if (-not [string]::IsNullOrWhiteSpace($ThumbprintValue)) {
-            $env:OMNIBUS_SIGNING_IDENTITY = "${ThumbprintValue}"
-        }
         $env:HOMEDRIVE = "C:"
         $env:HOMEPATH = "\Users\ContainerAdministrator"
         $env:OMNIBUS_TOOLCHAIN_INSTALL_DIR = "C:\opscode\omnibus-toolchain"
@@ -50,11 +43,9 @@ function Initialize-Environment {
         $env:BASH_ENV = "${env:MSYS2_INSTALL_DIR}\etc\bash.bashrc"
         $env:OMNIBUS_WINDOWS_ARCH = "x64"
         
-        # Configure MSYSTEM based on Ruby platform
+        # Configure MSYSTEM
         $env:MSYSTEM = "MINGW64"
         $omnibus_toolchain_msystem = & "${env:OMNIBUS_TOOLCHAIN_INSTALL_DIR}\embedded\bin\ruby" -e "puts RUBY_PLATFORM"
-        if ( -not $? ) { throw "Failed to determine Ruby platform" }
-        
         if ($omnibus_toolchain_msystem -eq "x64-mingw-ucrt") {
             $env:MSYSTEM = "UCRT64"
         }
@@ -62,8 +53,6 @@ function Initialize-Environment {
         # Set PATH
         $original_path = $env:PATH
         $env:PATH = "${env:MSYS2_INSTALL_DIR}\$env:MSYSTEM\bin;${env:MSYS2_INSTALL_DIR}\usr\bin;${env:OMNIBUS_TOOLCHAIN_INSTALL_DIR}\embedded\bin;C:\wix;${original_path}"
-        Write-Output "PATH = $env:PATH"
-        $env:Path -split ';' | ForEach-Object { $_ }
         
         Write-Verbose "Environment initialized successfully"
     }
@@ -73,78 +62,17 @@ function Initialize-Environment {
     }
 }
 
-function Get-AkeylessAccessId {
-    [CmdletBinding()]
-    param()
-
-    if (-not [string]::IsNullOrWhiteSpace($env:AKEYLESS_ACCESS_ID)) {
-        return $env:AKEYLESS_ACCESS_ID.Trim()
-    }
-
-    Write-Host "--- Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
-    $accessIdRaw = aws ssm get-parameter `
-        --name "buildkite-akeyless-access-id" `
-        --with-decryption `
-        --query "Parameter.Value" `
-        --output text 2>&1
-
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to retrieve AKEYLESS_ACCESS_ID from Parameter Store"
-    }
-
-    $accessId = ($accessIdRaw | Out-String).Trim()
-    if ($accessId -match "`n") {
-        $accessId = (($accessId -split "`r?`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1).Trim()
-    }
-
-    if ([string]::IsNullOrWhiteSpace($accessId)) {
-        throw "Parameter buildkite-akeyless-access-id returned an empty value"
-    }
-
-    return $accessId
-}
-
 function Initialize-ProgressSigning {
     [CmdletBinding()]
     param()
 
-    Write-Output "--- Initializing Progress EV code signing credentials"
+    Write-Output "Initializing Progress EV code signing credentials"
 
-    $localBin = "$env:USERPROFILE\.local\bin"
-    New-Item -Path $localBin -ItemType Directory -Force | Out-Null
-    $env:PATH = "$localBin;$env:PATH"
-    $akeylessExe = "$localBin\akeyless.exe"
-    $dotnetDir = "$env:USERPROFILE\.dotnet"
-    $env:DOTNET_ROOT = $dotnetDir
-    $env:PATH = "$dotnetDir\tools;$dotnetDir;$env:PATH"
-
-    if (-not (Test-Path $akeylessExe)) {
-        Invoke-WebRequest -Uri "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe" -OutFile $akeylessExe -UseBasicParsing
-    }
-
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-        $dotnetInstallScript = "$env:TEMP\dotnet-install.ps1"
-        Invoke-WebRequest -Uri "https://dot.net/v1/dotnet-install.ps1" -OutFile $dotnetInstallScript -UseBasicParsing
-        & $dotnetInstallScript -Channel 8.0 -InstallDir $dotnetDir
-    }
-
-    if (-not (Get-Command sign -ErrorAction SilentlyContinue)) {
-        dotnet tool install --global sign --prerelease
-    }
-
-    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        $azCliMsi = "$env:TEMP\azure-cli.msi"
-        Invoke-WebRequest -Uri "https://aka.ms/installazurecliwindows" -OutFile $azCliMsi -UseBasicParsing
-        Start-Process msiexec.exe -Wait -ArgumentList "/I $azCliMsi /quiet /norestart"
-        $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
-    }
-
-    # Check if Azure credentials are already initialized (from chef pre-command hook)
+    # Check if Azure credentials already initialized (from chef pre-command hook)
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
-        Write-Output "--- Azure credentials already initialized (from pre-command hook); skipping Akeyless auth"
-        # Ensure omnibus-specific vars are also set
+        Write-Output "Azure credentials already initialized (from pre-command hook); skipping Akeyless auth"
         if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
             $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
         }
@@ -154,86 +82,52 @@ function Initialize-ProgressSigning {
         return
     }
 
-    # Ensure AWS credentials are active before proceeding with Akeyless AWS IAM auth
-    Write-Output "--- Verifying AWS STS identity for Akeyless IAM authentication"
-    aws sts get-caller-identity 2>&1 | Out-Null
+    # Not pre-initialized; fetch from Akeyless
+    Write-Output "Fetching credentials from Akeyless"
+
+    # Download Akeyless CLI if needed
+    if (-not (Test-Path $AkeylessExe)) {
+        Write-Output "Downloading Akeyless CLI"
+        $AkeylessUrl = "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe"
+        Invoke-WebRequest -Uri $AkeylessUrl -OutFile $AkeylessExe -UseBasicParsing
+    }
+
+    # Fetch access ID from Parameter Store
+    $akeylessAccessId = if ($env:AKEYLESS_ACCESS_ID) {
+        $env:AKEYLESS_ACCESS_ID.Trim()
+    } else {
+        Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
+        (aws ssm get-parameter --name "buildkite-akeyless-access-id" --with-decryption --query "Parameter.Value" --output text).Trim()
+    }
+    
+    if ([string]::IsNullOrWhiteSpace($akeylessAccessId)) {
+        throw "Failed to get AKEYLESS_ACCESS_ID"
+    }
+
+    # Authenticate to Akeyless
+    Write-Output "Authenticating to Akeyless (aws_iam)"
+    $authOutput = & $AkeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
     if ($LASTEXITCODE -ne 0) {
-        throw "AWS credentials have expired or are missing. Cannot authenticate with Akeyless via aws_iam."
+        throw "Akeyless auth failed: $authOutput"
     }
-
-    $akeylessAccessId = Get-AkeylessAccessId
-
-    # Prevent first-run interactive profile prompts inside CI/docker jobs.
-    $env:AKEYLESS_CLI_NON_INTERACTIVE = "true"
-    $env:AKEYLESS_PROFILE = "default"
-
-    # Explicitly set the Akeyless API Gateway URL to prevent malformed endpoint errors
-    if ([string]::IsNullOrWhiteSpace($env:AKEYLESS_URL)) {
-        $env:AKEYLESS_URL = "https://api.akeyless.io"
+    
+    $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
+    if (-not $tokenMatch) {
+        throw "Could not extract Akeyless token from auth output: $authOutput"
     }
+    $akeylessToken = $tokenMatch.Matches[0].Groups[1].Value
 
-    $akeylessHome = "$env:USERPROFILE\.akeyless"
-    New-Item -ItemType Directory -Force -Path "$akeylessHome\profiles" | Out-Null
-
-    # Best-effort non-interactive profile bootstrap for aws_iam auth.
-    $configureOutput = & $akeylessExe configure --profile default --access-id $akeylessAccessId --access-type aws_iam --url $env:AKEYLESS_URL 2>&1
+    # Fetch dynamic secret
+    Write-Output "Fetching EV code signing credentials from Akeyless"
+    $dsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken 2>&1
     if ($LASTEXITCODE -ne 0) {
-        Write-Output "Akeyless configure returned non-zero; continuing with direct auth"
+        throw "Failed to fetch dynamic secret: $dsJson"
     }
-
-    Write-Output "--- setting up auth for akeyless"
-    $authOutput = & $akeylessExe auth --access-id $akeylessAccessId --access-type aws_iam --url $env:AKEYLESS_URL 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Akeyless auth failed"
-    }
-
-    $authText = ($authOutput | Out-String).Trim()
-    $akeylessToken = $null
-
-    # Newer/older akeyless CLI builds can emit either JSON or plain text.
-    try {
-        $authObj = $authText | ConvertFrom-Json -ErrorAction Stop
-        if (-not [string]::IsNullOrWhiteSpace($authObj.token)) {
-            $akeylessToken = $authObj.token.Trim()
-        }
-    }
-    catch {
-        # Non-JSON output, continue with regex parsing.
-    }
-
-    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
-        $tokenMatch = [regex]::Match($authText, '(?im)^\s*token\s*[:=]\s*([^\s"'']+)')
-        if ($tokenMatch.Success) {
-            $akeylessToken = $tokenMatch.Groups[1].Value.Trim()
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
-        $jsonTokenMatch = [regex]::Match($authText, '"token"\s*:\s*"([^"]+)"')
-        if ($jsonTokenMatch.Success) {
-            $akeylessToken = $jsonTokenMatch.Groups[1].Value.Trim()
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
-        $lastLine = ($authText -split "`r?`n" | Select-Object -Last 1).Trim()
-        if ($lastLine -match '^[A-Za-z0-9._=-]{20,}$') {
-            $akeylessToken = $lastLine
-        }
-    }
-
-    if ([string]::IsNullOrWhiteSpace($akeylessToken)) {
-        $preview = ($authText -split "`r?`n" | Select-Object -First 5) -join " | "
-        throw "Could not parse token from Akeyless auth output. Preview: $preview"
-    }
-    $dsJson = & $akeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken --url $env:AKEYLESS_URL 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to fetch EV code signing dynamic secret"
-    }
-
+    
     $ds = ($dsJson | ConvertFrom-Json).secret
+    
     if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or [string]::IsNullOrWhiteSpace($ds.appId) -or [string]::IsNullOrWhiteSpace($ds.secretText)) {
-        throw "Dynamic secret response is missing required Azure fields"
+        throw "Dynamic secret missing required Azure fields"
     }
 
     $env:AZURE_TENANT_ID = $ds.tenantId
@@ -241,43 +135,103 @@ function Initialize-ProgressSigning {
     $env:AZURE_CLIENT_SECRET = $ds.secretText
     $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
     $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
-
-    if (Get-Command az -ErrorAction SilentlyContinue) {
-        $loginOk = $false
-        for ($attempt = 1; $attempt -le 5; $attempt++) {
-            az login --service-principal --username $env:AZURE_CLIENT_ID --password $env:AZURE_CLIENT_SECRET --tenant $env:AZURE_TENANT_ID --output none 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                $loginOk = $true
-                break
-            }
-            if ($attempt -lt 5) {
-                Start-Sleep -Seconds 15
-            }
-        }
-        if (-not $loginOk) {
-            throw "az login failed after retries"
-        }
-    }
+    
+    Write-Output "Successfully retrieved Azure credentials"
 }
 
-function Set-SelfSignedCertificate {
+function Sign-ChefPackage {
     [CmdletBinding()]
     param()
     
     try {
-        Write-Output "--- Generating self-signed Windows package signing certificate"
-        $thumbprint = (New-SelfSignedCertificate -Type Custom -Subject "CN=Chef Software, O=Progress, C=US" -KeyUsage DigitalSignature -FriendlyName "Chef Software Inc." -CertStoreLocation "Cert:\LocalMachine\My" -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")).Thumbprint
-        if ( -not $? ) { throw "Failed to generate self-signed certificate" }
+        Write-Output "--- Signing Chef MSI"
         
-        return $thumbprint
+        $msiPath = Get-ChildItem -Path "C:\omnibus-ruby\chef\pkg\" -Filter *.msi | Select-Object -First 1
+        if (-not $msiPath) {
+            throw "No MSI file found in C:\omnibus-ruby\chef\pkg\"
+        }
+        
+        $msiPath = $msiPath.FullName
+        Write-Output "MSI file: $msiPath"
+        
+        # Azure login
+        Write-Output "Azure login (service principal)"
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+            az login --service-principal `
+                --username $env:AZURE_CLIENT_ID `
+                --password $env:AZURE_CLIENT_SECRET `
+                --tenant $env:AZURE_TENANT_ID `
+                --output none 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -lt 5) {
+                Write-Output "  Attempt $attempt/5 failed, retrying in 15s..."
+                Start-Sleep -Seconds 15
+            }
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "az login failed after 5 attempts"
+        }
+        Write-Output "[OK] Azure login successful"
+        
+        # Sign MSI using dotnet sign
+        Write-Output "Signing with dotnet sign"
+        $keyVaultUrl = $env:OMNIBUS_AZURE_KEY_VAULT_URL
+        $certificateName = $env:OMNIBUS_AZURE_CERT_NAME
+        $timestampServers = @(
+            "http://timestamp.acs.microsoft.com/",
+            "http://timestamp.globalsign.com/tsa/r45standard",
+            "http://ts.ssl.com/",
+            "http://timestamp.digicert.com"
+        )
+        
+        $signed = $false
+        foreach ($ts in $timestampServers) {
+            & sign code azure-key-vault $msiPath `
+                -d "Chef Infra Client" `
+                -u "https://www.chef.io" `
+                -kvu $keyVaultUrl `
+                -kvc $certificateName `
+                -fd sha256 `
+                -td sha256 `
+                -t $ts 2>&1 | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                Write-Output "[OK] Signed successfully using timestamp server: $ts"
+                $signed = $true
+                break
+            }
+            Write-Output "  Timestamp server $ts failed, trying next..."
+        }
+        
+        if (-not $signed) {
+            throw "Signing failed with all timestamp servers"
+        }
+        
+        # Verify signature
+        Write-Output "Verifying signature"
+        $sig = Get-AuthenticodeSignature -FilePath $msiPath
+        Write-Output "  Status: $($sig.Status)"
+        Write-Output "  Subject: $($sig.SignerCertificate.Subject)"
+        Write-Output "  Valid From: $($sig.SignerCertificate.NotBefore)"
+        Write-Output "  Valid To: $($sig.SignerCertificate.NotAfter)"
+        
+        if ($sig.Status -ne 'Valid') {
+            throw "Signature verification failed: $($sig.Status)"
+        }
+        Write-Output "[OK] Signature is valid"
     }
     catch {
-        Write-Error "Failed to set up self-signed certificate: $_"
+        Write-Error "Signing failed: $_"
         exit 1
     }
+    finally {
+        # Cleanup credentials
+        Remove-Item Env:AZURE_TENANT_ID -ErrorAction SilentlyContinue
+        Remove-Item Env:AZURE_CLIENT_ID -ErrorAction SilentlyContinue
+        Remove-Item Env:AZURE_CLIENT_SECRET -ErrorAction SilentlyContinue
+        az logout 2>&1 | Out-Null
+        Write-Output "Credentials cleared"
+    }
 }
-
-function Get-SmctlCertificate {
     [CmdletBinding()]
     param()
     
