@@ -187,118 +187,195 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-.* ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG"
     
     echo "GITHUB_TOKEN set for private repository access"
 fi
+
 # Initialize Progress EV code signing credentials for Windows builds
 # Chef-18 requires Azure credentials in Docker environment before build starts
-# Uses Akeyless CLI (pre-installed on Windows agent) via aws_iam authentication
 if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_SLUG" =~ chef(-canary)?$ ]]; then
+
   echo "--- Initializing Progress EV code signing credentials"
-  
-  # Fetch Akeyless access ID from AWS Parameter Store
+
   echo "Fetching Akeyless access ID from AWS Parameter Store..."
+
   AKEYLESS_ACCESS_ID=$(aws ssm get-parameter \
     --name "buildkite-akeyless-access-id" \
     --with-decryption \
     --query "Parameter.Value" \
     --output text \
-    --region "${AWS_REGION}") || {
-    echo "ERROR: Failed to fetch Akeyless access ID from Parameter Store"
-    exit 1
-  }
-  
-  [[ -z "$AKEYLESS_ACCESS_ID" ]] && { 
+    --region "${AWS_REGION}" | tr -d '\r\n ')
+
+
+  if [[ -z "$AKEYLESS_ACCESS_ID" ]]; then
     echo "ERROR: AKEYLESS_ACCESS_ID is empty"
-    exit 1 
-  }
-  echo "✓ Akeyless access ID fetched: ${AKEYLESS_ACCESS_ID:0:20}..."
-  export AKEYLESS_ACCESS_ID
-  
-  # Use PowerShell to invoke Akeyless CLI (Windows native, more reliable than bash curl)
-  # This mirrors the chef-installer-scripts pattern exactly
-  echo "Authenticating to Akeyless with AWS IAM method (via PowerShell)..."
-  
-  # Create temporary PowerShell script file
-  PSCRIPT=$(mktemp)
-  cat > "$PSCRIPT" << 'PSEOF'
-$LocalBin = "$env:USERPROFILE\.local\bin"
-$AkeylessExe = "$LocalBin\akeyless.exe"
-
-# Test if Akeyless CLI is available
-if (-not (Test-Path $AkeylessExe)) {
-  Write-Error "Akeyless CLI not found at: $AkeylessExe"
-  exit 1
-}
-
-# Authenticate with aws_iam method
-$authOutput = & $AkeylessExe auth --access-id $env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1
-if ($LASTEXITCODE -ne 0) {
-  Write-Error "Akeyless auth failed: $authOutput"
-  exit 1
-}
-
-# Extract token from output
-$tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
-if (-not $tokenMatch) {
-  Write-Error "Could not extract Akeyless token. Output: $authOutput"
-  exit 1
-}
-$token = $tokenMatch.Matches[0].Groups[1].Value
-
-# Fetch dynamic secret
-$dsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $token 2>&1
-if ($LASTEXITCODE -ne 0) {
-  Write-Error "Failed to fetch EV code signing dynamic secret: $dsJson"
-  exit 1
-}
-
-# Parse and export Azure credentials
-$ds = $dsJson | ConvertFrom-Json
-$creds = @{
-  AZURE_TENANT_ID = $ds.secret.tenantId
-  AZURE_CLIENT_ID = $ds.secret.appId
-  AZURE_CLIENT_SECRET = $ds.secret.secretText
-}
-
-# Validate all credentials present
-foreach ($key in $creds.Keys) {
-  if ([string]::IsNullOrWhiteSpace($creds[$key])) {
-    Write-Error "Missing credential: $key"
-    exit 1
-  }
-}
-
-# Output as shell export format
-Write-Output "AZURE_TENANT_ID=$($creds.AZURE_TENANT_ID)"
-Write-Output "AZURE_CLIENT_ID=$($creds.AZURE_CLIENT_ID)"
-Write-Output "AZURE_CLIENT_SECRET=$($creds.AZURE_CLIENT_SECRET)"
-PSEOF
-
-  CREDS=$(powershell -NoProfile -File "$PSCRIPT" 2>&1) || {
-    echo "ERROR: PowerShell Akeyless credential fetch failed:"
-    echo "$CREDS"
-    rm -f "$PSCRIPT"
-    exit 1
-  }
-  rm -f "$PSCRIPT"
-  
-  # Parse PowerShell output and export to bash environment
-  eval "$CREDS"
-  
-  if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
-    echo "ERROR: Failed to extract Azure credentials from PowerShell output"
-    echo "Parsed output: $CREDS"
     exit 1
   fi
-  echo "✓ All Azure credentials extracted successfully"
-  
-  # Export for Docker container (propagate-environment: true in docker plugin config)
+
+
+  echo "✓ Akeyless access ID fetched"
+  echo "DEBUG: access_id prefix: ${AKEYLESS_ACCESS_ID:0:20}"
+  echo "DEBUG: access_id length: ${#AKEYLESS_ACCESS_ID}"
+
+
+  echo "Validating AWS IAM credentials..."
+
+  echo "DEBUG: AWS_ACCESS_KEY_ID length: ${#AWS_ACCESS_KEY_ID}"
+  echo "DEBUG: AWS_SECRET_ACCESS_KEY length: ${#AWS_SECRET_ACCESS_KEY}"
+  echo "DEBUG: AWS_SESSION_TOKEN length: ${#AWS_SESSION_TOKEN}"
+
+
+  if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]] || \
+     [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]] || \
+     [[ -z "${AWS_SESSION_TOKEN:-}" ]]; then
+
+    echo "ERROR: AWS credentials missing"
+    exit 1
+  fi
+
+
+  echo "Authenticating to Akeyless using AWS IAM..."
+
+
+  # Generate JSON safely
+  AUTH_PAYLOAD=$(jq -n \
+    --arg access_id "$AKEYLESS_ACCESS_ID" \
+    '{
+      access_id: $access_id,
+      access_type: "aws_iam"
+    }')
+
+
+  echo "DEBUG: Akeyless request payload:"
+  echo "$AUTH_PAYLOAD"
+
+
+  AKEYLESS_AUTH=$(echo "$AUTH_PAYLOAD" | \
+    curl -sX POST \
+      "https://api.akeyless.io/auth" \
+      -H "Content-Type: application/json" \
+      -d @-)
+
+
+  echo "DEBUG: Akeyless auth response:"
+  echo "$AKEYLESS_AUTH" | head -c 500
+  echo
+
+
+  if echo "$AKEYLESS_AUTH" | jq -e '.error' >/dev/null 2>&1; then
+
+    ERROR_MSG=$(echo "$AKEYLESS_AUTH" | jq -r '.error')
+
+    echo "ERROR: Akeyless API error: $ERROR_MSG"
+    echo "Full response:"
+    echo "$AKEYLESS_AUTH"
+
+    exit 1
+  fi
+
+
+  AKEYLESS_TOKEN=$(echo "$AKEYLESS_AUTH" | \
+    jq -r '.access_token // .token // empty')
+
+
+  if [[ -z "$AKEYLESS_TOKEN" ]]; then
+
+    echo "ERROR: Failed to extract Akeyless token"
+    echo "$AKEYLESS_AUTH"
+
+    exit 1
+  fi
+
+
+  echo "✓ Akeyless authentication successful"
+
+    #
+  # Fetch EV code signing dynamic secret from Akeyless
+  #
+  echo "Fetching EV code signing secret from Akeyless..."
+
+
+  SECRET_PAYLOAD=$(jq -n \
+    '{
+      name: "/DevOps/EvCodeSign/evcodesignservice"
+    }')
+
+
+  DYNAMIC_SECRET=$(echo "$SECRET_PAYLOAD" | \
+    curl -sX POST \
+      "https://api.akeyless.io/dynamic-secret-get-value" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer $AKEYLESS_TOKEN" \
+      -d @-)
+
+
+  echo "DEBUG: Dynamic secret response:"
+  echo "$DYNAMIC_SECRET" | head -c 500
+  echo
+
+
+  if echo "$DYNAMIC_SECRET" | jq -e '.error' >/dev/null 2>&1; then
+
+    ERROR_MSG=$(echo "$DYNAMIC_SECRET" | jq -r '.error')
+
+    echo "ERROR: Akeyless API error: $ERROR_MSG"
+    echo "Full response:"
+    echo "$DYNAMIC_SECRET"
+
+    exit 1
+  fi
+
+
+  echo "Extracting Azure credentials..."
+
+
+  AZURE_TENANT_ID=$(echo "$DYNAMIC_SECRET" | \
+    jq -r '.secret.tenantId // .tenantId // empty')
+
+
+  AZURE_CLIENT_ID=$(echo "$DYNAMIC_SECRET" | \
+    jq -r '.secret.appId // .appId // .secret.clientId // .clientId // empty')
+
+
+  AZURE_CLIENT_SECRET=$(echo "$DYNAMIC_SECRET" | \
+    jq -r '.secret.secretText // .secretText // empty')
+
+
+  if [[ -z "$AZURE_TENANT_ID" ]] || \
+     [[ -z "$AZURE_CLIENT_ID" ]] || \
+     [[ -z "$AZURE_CLIENT_SECRET" ]]; then
+
+    echo "ERROR: Missing Azure credentials from Akeyless response"
+
+    echo "Tenant ID:"
+    echo "$AZURE_TENANT_ID"
+
+    echo "Client ID:"
+    echo "$AZURE_CLIENT_ID"
+
+    echo "Client Secret length:"
+    echo "${#AZURE_CLIENT_SECRET}"
+
+    exit 1
+  fi
+
+
+  echo "✓ All Azure credentials extracted"
+
+
+  #
+  # Export variables for Docker/container build
+  #
   export AZURE_TENANT_ID
   export AZURE_CLIENT_ID
   export AZURE_CLIENT_SECRET
+
   export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
   export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
-  
-  # Also write to BUILDKITE_ENV_FILE for downstream step persistence
+
+
+  #
+  # Persist variables for downstream Buildkite commands
+  #
   if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
+
     {
       echo "export AZURE_TENANT_ID='${AZURE_TENANT_ID}'"
       echo "export AZURE_CLIENT_ID='${AZURE_CLIENT_ID}'"
@@ -306,11 +383,17 @@ PSEOF
       echo "export OMNIBUS_AZURE_KEY_VAULT_URL='https://caps-evcodesign-useast.vault.azure.net'"
       echo "export OMNIBUS_AZURE_CERT_NAME='psc-evcodesign'"
     } >> "$BUILDKITE_ENV_FILE"
+
+
     echo "✓ Credentials persisted to BUILDKITE_ENV_FILE"
   fi
-  
-  echo "✓ Progress EV credentials ready for omnibus_chef_build.ps1"
-elif [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]]; then
-  echo "--- Skipping Progress EV credentials (not chef/chef-canary org)"
-fi
 
+
+  echo "✓ Progress EV credentials ready for omnibus_chef_build.ps1"
+
+
+elif [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]]; then
+
+  echo "--- Skipping Progress EV credentials (not chef/chef-canary org)"
+
+fi
