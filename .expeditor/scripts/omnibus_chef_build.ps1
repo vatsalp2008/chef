@@ -11,6 +11,13 @@ param()
 
 # Global variables and script-wide error handling
 $ErrorActionPreference = "Stop"
+
+# Source build-settings from omnibus-buildkite-plugin if available (contains AZURE_* vars)
+$buildSettingsPath = "./.omnibus-buildkite-plugin/build-settings.ps1"
+if (Test-Path $buildSettingsPath) {
+    Write-Output "Sourcing build-settings from omnibus-buildkite-plugin"
+    . $buildSettingsPath
+}
 $ScriptDir = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
 $DefaultSigningThumbprint = "EEB3EC48AA807336AA732AC9B310131DFAA034D1"
 $DefaultKeypairAlias = "key_1340572417"
