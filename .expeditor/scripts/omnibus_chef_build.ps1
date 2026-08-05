@@ -232,177 +232,6 @@ function Sign-ChefPackage {
         Write-Output "Credentials cleared"
     }
 }
-    [CmdletBinding()]
-    param()
-    
-    try {
-        Write-Output "--- setting up auth for smctl"
-        $SM_CLIENT_CERT_FILE_JSON = "sm-client-cert-file.json"
-        aws ssm get-parameter --name "sm-client-cert-file" --with-decryption --region "us-west-1" --query Parameter.Value --output text | Set-Content -Path $SM_CLIENT_CERT_FILE_JSON
-        if ( -not $? ) { throw "Failed to get sm-client-cert-file parameter" }
-        
-        # Process the JSON certificate content
-        $smClientCertJson = Get-Content $SM_CLIENT_CERT_FILE_JSON | ConvertFrom-Json | Select-Object -ExpandProperty cert_content_base64
-        if ( -not $? ) { throw "Failed to parse sm-client-cert-file JSON" }
-        
-        $decodedFilePath = "c:\digicert\certificate_pkcs12.p12"
-        Write-Output "Decoding certificate content to $decodedFilePath"
-        [System.IO.File]::WriteAllBytes($decodedFilePath, [System.Convert]::FromBase64String($smClientCertJson))
-        if ( -not $? ) { throw "Failed to write certificate file" }
-        
-        # Verify the certificate file
-        $file = Get-ChildItem -Path "c:\digicert\certificate_pkcs12.p12"
-        if ( -not $? ) { throw "Failed to get certificate file" }
-
-        if ($file.Length -eq 2902) {
-            Write-Output "Certificate file verified (length = 2902 bytes)"
-        }
-        else {
-            throw "Certificate file has incorrect length: $($file.Length) bytes"
-        }
-    }
-    catch {
-        Write-Error "Failed to get smctl certificate: $_"
-        exit 1
-    }
-}
-
-function Set-SmctlCredentials {
-    [CmdletBinding()]
-    param()
-    
-    try {
-        Write-Output "--- smtcl env settings"
-        $SM_API_KEY_VALUE = aws ssm get-parameter --name "sm-api-key" --with-decryption --region "us-west-1" --query Parameter.Value --output text
-        if ( -not $? ) { throw "Failed to get sm-api-key parameter" }
-        
-        $SM_CLIENT_CERT_PASSWORD_VALUE = aws ssm get-parameter --name "sm-client-cert-password" --with-decryption --region "us-west-1" --query Parameter.Value --output text
-        if ( -not $? ) { throw "Failed to get sm-client-cert-password parameter" }
-        
-        $SM_HOST_VALUE = aws ssm get-parameter --name "sm-host" --with-decryption --region "us-west-1" --query Parameter.Value --output text
-        if ( -not $? ) { throw "Failed to get sm-host parameter" }
-        
-        $env:SM_API_KEY_FILE = ${SM_API_KEY_VALUE}
-        $env:SM_HOST = ${SM_HOST_VALUE}
-        $env:SM_CLIENT_CERT_FILE = "c:\digicert\certificate_pkcs12.p12"
-        $env:SM_CLIENT_CERT_PASSWORD_FILE = ${SM_CLIENT_CERT_PASSWORD_VALUE}
-        
-        smctl credentials save ${SM_API_KEY_VALUE} ${SM_CLIENT_CERT_PASSWORD_VALUE}
-        if ( -not $? ) { throw "Failed to save smctl credentials" }
-    }
-    catch {
-        Write-Error "Failed to set smctl credentials: $_"
-        exit 1
-    }
-}
-
-function Register-SmctlCertificates {
-    [CmdletBinding()]
-    param()
-    
-    try {
-        if ($env:DEBUGSMCTL -eq $true) {
-            Write-Output "--- Debug SMCTLCert registration is enabled, adding some additional testing output"
-            smksp_registrar.exe list
-            smksp_registrar.exe remove
-            if ( -not $? ) { throw "Failed to remove DigiCert Signing Manager and Trust Manager KSP" }
-            smksp_registrar.exe list
-
-            Write-Output "--- smksp_registrar sync certs before chef install"
-            smksp_registrar.exe register
-            if ( -not $? ) { throw "Failed to register certificates" }
-            smksp_registrar.exe list
-            if ( -not $? ) { throw "Failed to register certificates" }
-
-            Write-Output "--- Get Healthcheck Status"
-            smctl healthcheck
-            if ( -not $? ) { throw "Failed to get smctl healthcheck status" }
-
-            Write-Output "--- get SMCTL logs"
-            get-content C:\Users\$env:USERNAME\.signingmanager\logs\smctl.log
-            if (-not $?) { throw "Failed to get SMCTL logs" }
-        }
-        else {
-            Write-Output "--- smksp_registrar unregister first"
-            smksp_registrar.exe remove
-            if ( -not $? ) { throw "Failed to remove DigiCert Signing Manager and Trust Manager KSP" }
-            
-            Write-Output "--- smksp_registrar sync certs before chef install"
-            smksp_registrar.exe register
-            if ( -not $? ) { throw "Failed to register certificates" }
-    
-            $keypairAlias = if (-not [string]::IsNullOrWhiteSpace($env:key_pair_alias)) {
-                $env:key_pair_alias.Trim()
-            }
-            elseif (-not [string]::IsNullOrWhiteSpace($env:OMNIBUS_KEYPAIR_ALIAS)) {
-                $env:OMNIBUS_KEYPAIR_ALIAS.Trim()
-            }
-            else {
-                $DefaultKeypairAlias
-            }
-
-            Write-Output "--- Installing Windows package signing certificate using smctl cli (keypair alias: $keypairAlias)"
-            smctl windows certsync --keypair-alias=$keypairAlias
-            if ( -not $? ) { throw "Failed to sync certificates using smctl" }   
-        }
-    }
-    catch {
-        Write-Error "Failed to register smctl certificates: $_"
-        exit 1
-    }
-}
-
-function Smctl-Debug {
-    [CmdletBinding()]
-    param()
-    try {
-        if ($env:DEBUGSMCTL -eq $true) {
-            Write-Output "--- Setting SM_LOG_LEVEL to TRACE as DEBUGSMCTL is true"        
-            $env:SM_LOG_LEVEL="TRACE"
-            if (-not $?) { throw "Failed to set SM_LOG_LEVEL" }
-        }
-    }
-    catch {
-        Write-Error "--- Failed to set SM_LOG_LEVEL: $_"
-    }    
-}
-
-function Get-Certificate {
-    [CmdletBinding()]
-    param()
-    
-    try {
-        $thumbprint = if (-not [string]::IsNullOrWhiteSpace($env:OMNIBUS_SIGNING_IDENTITY)) {
-            $env:OMNIBUS_SIGNING_IDENTITY.Trim()
-        }
-        else {
-            $DefaultSigningThumbprint
-        }
-
-        # List all certificate from the Current User's Personal store by thumbprint
-        $certificate = Get-ChildItem -Path Cert:\CurrentUser\My -Recurse | Where-Object { $_.Thumbprint -eq $thumbprint }
-        if ( -not $? ) { throw "Failed to retrieve certificates" }
-
-        Write-Host "--- Display information about the retrieved certificate"
-        
-        if ($certificate) {
-            Write-Host "Certificate Subject: $($certificate.Subject)"
-            Write-Host "Issuer: $($certificate.Issuer)"
-            Write-Host "Valid From: $($certificate.NotBefore)"
-            Write-Host "Valid To: $($certificate.NotAfter)"
-            Write-Host "Has Private key: $($certificate.HasPrivateKey)"
-            
-            # Return only the thumbprint string, not the Write-Output results
-            return $thumbprint.ToString()
-        } else {
-            throw "Certificate with thumbprint $thumbprint not found"
-        }
-    }
-    catch {
-        Write-Error "Failed to get certificate: $_"
-        exit 1
-    }
-}
 
 function Install-ChefFoundation {
     [CmdletBinding()]
@@ -580,91 +409,6 @@ function Build-ChefPackage {
     }
 }
 
-function Verify-SignedPackage {
-    [CmdletBinding()]
-    param()
-    
-    $verificationFailed = $false
-    $errorMessage = ""
-    
-    try {
-        $directoryPath = "C:\omnibus-ruby\chef\pkg\"
-        $msiFile = Get-ChildItem -Path $directoryPath -Filter *.msi | Select-Object -First 1
-        if ( -not $? ) { throw "Failed to list MSI files" }
-        
-        Write-Output "--- test msi path"
-        
-        # Check if an .msi file was found
-        if ($msiFile -ne $null) {
-            $fullPath = $msiFile.FullName
-            Write-Output "Found .msi file: $fullPath"
-            
-            Write-Output "--- verify signed file using signtool"
-            $signToolOutput = signtool verify /pa $fullPath 2>&1 | Out-String
-            
-            if ($LASTEXITCODE -ne 0) {
-                $verificationFailed = $true
-                $errorMessage = "signtool verification failed: $signToolOutput"
-            }
-            
-            if (-not $verificationFailed) {
-                Write-Output "MSI signing verification passed"
-            }
-        } else {
-            $verificationFailed = $true
-            $errorMessage = "No .msi files found in the directory: $directoryPath"
-        }
-    }
-    catch {
-        $verificationFailed = $true
-        $errorMessage = "Package verification failed: $_"
-    }
-    
-    try {
-        if ($env:DEBUGSMCTL -eq $true) {
-            Write-Output "--- grabbing smctl logs"
-            Get-Content $home\.signingmanager\logs\smctl.log -ErrorAction SilentlyContinue
-            Get-Content $home\.signingmanager\logs\smksp.log -ErrorAction SilentlyContinue
-            Get-Content $home\.signingmanager\logs\smksp_cert_sync.log -ErrorAction SilentlyContinue
-            Write-Host "--- list all keys available to the current user"
-            certutil.exe -csp "DigiCert Software Trust Manager KSP" -key -user
-        }
-    }
-    catch {
-        Write-Error "--- All smctl logs not found, please check smctl configuration"
-    }
-    
-    if ($verificationFailed) {
-        Write-Error $errorMessage
-        exit 1
-    }
-}
-
-function Cleanup-SmctlCredentials {
-    [CmdletBinding()]
-    param()
-    
-    try {
-        if (Get-Command smctl -ErrorAction SilentlyContinue) {
-            Write-Output "--- smctl credentials delete just to clean up"
-            smctl windows certdesync
-        }
-
-        if (Get-Command az -ErrorAction SilentlyContinue) {
-            Write-Output "--- Azure logout"
-            az logout 2>&1 | Out-Null
-        }
-
-        Remove-Item Env:AZURE_TENANT_ID -ErrorAction SilentlyContinue
-        Remove-Item Env:AZURE_CLIENT_ID -ErrorAction SilentlyContinue
-        Remove-Item Env:AZURE_CLIENT_SECRET -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Error "Failed to clean up signing credentials: $_"
-        Write-Warning "Continuing despite credential cleanup failure"
-    }
-}
-
 function Upload-BuildkiteArtifact {
     [CmdletBinding()]
     param()
@@ -705,28 +449,19 @@ function Publish-ToArtifactory {
 
 # Main execution block
 try {
-    if ($env:BUILDKITE_ORGANIZATION_SLUG -eq "chef-oss") {
-        $thumbprint = Set-SelfSignedCertificate
-        $thumbprint = $thumbprint.Trim()
-        Write-Output "THUMB=$thumbprint"
-        Initialize-Environment -ThumbprintValue $thumbprint
-    }
-    else {
-        Initialize-ProgressSigning
-        Initialize-Environment
-    }
-
+    Initialize-ProgressSigning
+    Initialize-Environment
+    
     Install-ChefFoundation
     Install-OmnibusDependencies
     
     Build-ChefPackage
-    Verify-SignedPackage
+    Sign-ChefPackage
     
-    Cleanup-SmctlCredentials
     Upload-BuildkiteArtifact
     Publish-ToArtifactory
     
-    Write-Output "Chef build and publish completed successfully"
+    Write-Output "Chef build and signing completed successfully"
     exit 0
 }
 catch {
