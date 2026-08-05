@@ -216,63 +216,69 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # This mirrors the chef-installer-scripts pattern exactly
   echo "Authenticating to Akeyless with AWS IAM method (via PowerShell)..."
   
-  CREDS=$(powershell -NoProfile -Command @"
-    \$LocalBin = \"\$env:USERPROFILE\.local\bin\"
-    \$AkeylessExe = \"\$LocalBin\akeyless.exe\"
-    
-    # Test if Akeyless CLI is available
-    if (-not (Test-Path \$AkeylessExe)) {
-      Write-Error \"Akeyless CLI not found at: \$AkeylessExe\"
-      exit 1
-    }
-    
-    # Authenticate with aws_iam method
-    \$authOutput = & \$AkeylessExe auth --access-id \$env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1
-    if (\$LASTEXITCODE -ne 0) {
-      Write-Error \"Akeyless auth failed: \$authOutput\"
-      exit 1
-    }
-    
-    # Extract token from output
-    \$tokenMatch = \$authOutput | Select-String -Pattern 'Token:\s+(\S+)'
-    if (-not \$tokenMatch) {
-      Write-Error \"Could not extract Akeyless token. Output: \$authOutput\"
-      exit 1
-    }
-    \$token = \$tokenMatch.Matches[0].Groups[1].Value
-    
-    # Fetch dynamic secret
-    \$dsJson = & \$AkeylessExe dynamic-secret get-value --name \"/DevOps/EvCodeSign/evcodesignservice\" --token \$token 2>&1
-    if (\$LASTEXITCODE -ne 0) {
-      Write-Error \"Failed to fetch EV code signing dynamic secret: \$dsJson\"
-      exit 1
-    }
-    
-    # Parse and export Azure credentials
-    \$ds = \$dsJson | ConvertFrom-Json
-    \$creds = @{
-      AZURE_TENANT_ID = \$ds.secret.tenantId
-      AZURE_CLIENT_ID = \$ds.secret.appId
-      AZURE_CLIENT_SECRET = \$ds.secret.secretText
-    }
-    
-    # Validate all credentials present
-    foreach (\$key in \$creds.Keys) {
-      if ([string]::IsNullOrWhiteSpace(\$creds[\$key])) {
-        Write-Error \"Missing credential: \$key\"
-        exit 1
-      }
-    }
-    
-    # Output as shell export format
-    Write-Output \"AZURE_TENANT_ID=\$(\$creds.AZURE_TENANT_ID)\"
-    Write-Output \"AZURE_CLIENT_ID=\$(\$creds.AZURE_CLIENT_ID)\"
-    Write-Output \"AZURE_CLIENT_SECRET=\$(\$creds.AZURE_CLIENT_SECRET)\"
-"@ 2>&1) || {
-    echo "ERROR: PowerShell Akeyless credential fetch failed:"
-    echo "$CREDS"
+  # Create temporary PowerShell script file
+  PSCRIPT=$(mktemp)
+  cat > "$PSCRIPT" << 'PSEOF'
+$LocalBin = "$env:USERPROFILE\.local\bin"
+$AkeylessExe = "$LocalBin\akeyless.exe"
+
+# Test if Akeyless CLI is available
+if (-not (Test-Path $AkeylessExe)) {
+  Write-Error "Akeyless CLI not found at: $AkeylessExe"
+  exit 1
+}
+
+# Authenticate with aws_iam method
+$authOutput = & $AkeylessExe auth --access-id $env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "Akeyless auth failed: $authOutput"
+  exit 1
+}
+
+# Extract token from output
+$tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
+if (-not $tokenMatch) {
+  Write-Error "Could not extract Akeyless token. Output: $authOutput"
+  exit 1
+}
+$token = $tokenMatch.Matches[0].Groups[1].Value
+
+# Fetch dynamic secret
+$dsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $token 2>&1
+if ($LASTEXITCODE -ne 0) {
+  Write-Error "Failed to fetch EV code signing dynamic secret: $dsJson"
+  exit 1
+}
+
+# Parse and export Azure credentials
+$ds = $dsJson | ConvertFrom-Json
+$creds = @{
+  AZURE_TENANT_ID = $ds.secret.tenantId
+  AZURE_CLIENT_ID = $ds.secret.appId
+  AZURE_CLIENT_SECRET = $ds.secret.secretText
+}
+
+# Validate all credentials present
+foreach ($key in $creds.Keys) {
+  if ([string]::IsNullOrWhiteSpace($creds[$key])) {
+    Write-Error "Missing credential: $key"
     exit 1
   }
+}
+
+# Output as shell export format
+Write-Output "AZURE_TENANT_ID=$($creds.AZURE_TENANT_ID)"
+Write-Output "AZURE_CLIENT_ID=$($creds.AZURE_CLIENT_ID)"
+Write-Output "AZURE_CLIENT_SECRET=$($creds.AZURE_CLIENT_SECRET)"
+PSEOF
+
+  CREDS=$(powershell -NoProfile -File "$PSCRIPT" 2>&1) || {
+    echo "ERROR: PowerShell Akeyless credential fetch failed:"
+    echo "$CREDS"
+    rm -f "$PSCRIPT"
+    exit 1
+  }
+  rm -f "$PSCRIPT"
   
   # Parse PowerShell output and export to bash environment
   eval "$CREDS"
