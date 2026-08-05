@@ -68,11 +68,11 @@ function Initialize-ProgressSigning {
 
     Write-Output "Initializing Progress EV code signing credentials"
 
-    # Check if Azure credentials already initialized (from pre-command hook or environment)
+    # Check if Azure credentials already initialized (from environment)
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
-        Write-Output "Azure credentials already initialized; skipping Akeyless auth"
+        Write-Output "Azure credentials already initialized"
         if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
             $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
         }
@@ -82,7 +82,7 @@ function Initialize-ProgressSigning {
         return
     }
 
-    # Fetch credentials from Akeyless
+    # Fetch credentials from Akeyless (self-contained for Docker builds)
     Write-Output "Fetching Progress EV credentials from Akeyless"
     
     try {
@@ -93,20 +93,32 @@ function Initialize-ProgressSigning {
             Invoke-WebRequest -Uri $AkeylessUrl -OutFile $AkeylessExe -UseBasicParsing
         }
 
+        # Get AWS region (default to us-west-2 for Parameter Store access)
+        $awsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
+
         # Fetch access ID from Parameter Store
         $akeylessAccessId = if ($env:AKEYLESS_ACCESS_ID) {
             $env:AKEYLESS_ACCESS_ID.Trim()
         } else {
-            Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
-            $region = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
-            (aws ssm get-parameter --name "buildkite-akeyless-access-id" --with-decryption --region $region --query "Parameter.Value" --output text 2>&1).Trim()
+            Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store (region: $awsRegion)"
+            $paramOutput = aws ssm get-parameter `
+                --name "buildkite-akeyless-access-id" `
+                --with-decryption `
+                --region $awsRegion `
+                --query "Parameter.Value" `
+                --output text 2>&1
+            
+            if ($LASTEXITCODE -ne 0) {
+                throw "AWS Parameter Store access failed: $paramOutput"
+            }
+            $paramOutput.Trim()
         }
         
         if ([string]::IsNullOrWhiteSpace($akeylessAccessId)) {
-            throw "Failed to get AKEYLESS_ACCESS_ID from environment or Parameter Store"
+            throw "AKEYLESS_ACCESS_ID is empty"
         }
 
-        # Authenticate to Akeyless
+        # Authenticate to Akeyless using AWS IAM
         Write-Output "Authenticating to Akeyless (aws_iam)"
         $authOutput = & $AkeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
         if ($LASTEXITCODE -ne 0) {
@@ -115,30 +127,36 @@ function Initialize-ProgressSigning {
         
         $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
         if (-not $tokenMatch) {
-            throw "Could not extract Akeyless token from auth output"
+            throw "Could not extract Akeyless token from auth response"
         }
         $akeylessToken = $tokenMatch.Matches[0].Groups[1].Value
 
-        # Fetch dynamic secret
+        # Fetch dynamic secret from Akeyless
         Write-Output "Fetching EV code signing credentials from Akeyless"
-        $dsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken 2>&1
+        $dsJson = & $AkeylessExe dynamic-secret get-value `
+            --name "/DevOps/EvCodeSign/evcodesignservice" `
+            --token $akeylessToken 2>&1
+        
         if ($LASTEXITCODE -ne 0) {
             throw "Failed to fetch dynamic secret: $dsJson"
         }
         
         $ds = ($dsJson | ConvertFrom-Json).secret
         
-        if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or [string]::IsNullOrWhiteSpace($ds.appId) -or [string]::IsNullOrWhiteSpace($ds.secretText)) {
-            throw "Dynamic secret missing required Azure fields"
+        if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or `
+            [string]::IsNullOrWhiteSpace($ds.appId) -or `
+            [string]::IsNullOrWhiteSpace($ds.secretText)) {
+            throw "Dynamic secret missing required Azure fields (tenantId, appId, secretText)"
         }
 
+        # Set Azure environment variables for dotnet sign tool
         $env:AZURE_TENANT_ID = $ds.tenantId
         $env:AZURE_CLIENT_ID = $ds.appId
         $env:AZURE_CLIENT_SECRET = $ds.secretText
         $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
         $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
         
-        Write-Output "Successfully retrieved Azure credentials from Akeyless"
+        Write-Output "[OK] Azure credentials successfully fetched from Akeyless"
     }
     catch {
         Write-Error "Failed to initialize Progress EV credentials: $_"
