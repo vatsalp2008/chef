@@ -195,75 +195,98 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   AZURE_ENV_FILE=".buildkite-azure-env"
   
   # Fetch Akeyless access ID from AWS Parameter Store
+  echo "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store..."
   AKEYLESS_ACCESS_ID=$(aws ssm get-parameter \
     --name "buildkite-akeyless-access-id" \
     --with-decryption \
     --query "Parameter.Value" \
     --output text \
     --region "${AWS_REGION}") || {
-    echo "Failed to fetch Akeyless access ID from Parameter Store"
+    echo "ERROR: Failed to fetch Akeyless access ID from Parameter Store"
     exit 1
   }
   
+  if [[ -z "$AKEYLESS_ACCESS_ID" ]]; then
+    echo "ERROR: AKEYLESS_ACCESS_ID is empty"
+    exit 1
+  fi
+  echo "✓ AKEYLESS_ACCESS_ID fetched successfully"
+  
   # Check if akeyless CLI is available
   if ! command -v akeyless &> /dev/null; then
-    echo "Akeyless CLI not found; will initialize in Docker container"
-    # Write sentinel so omnibus knows pre-command ran
-    echo "export BUILDKITE_PRECOMMAND_RAN=true" > "$AZURE_ENV_FILE"
+    echo "WARNING: Akeyless CLI not found; Docker container must have akeyless-cli pre-installed"
+    echo "         Skipping credential fetch - will attempt in Docker container"
+    # Write sentinel so we know pre-command ran
+    echo "export BUILDKITE_PRECOMMAND_RAN=true" >> "${BUILDKITE_ENV_FILE:-/dev/null}"
     exit 0
   fi
   
   # Authenticate to Akeyless and retrieve dynamic secret
-  echo "Authenticating to Akeyless"
-  AKEYLESS_TOKEN=$(akeyless auth \
+  echo "Authenticating to Akeyless using AWS IAM method..."
+  AKEYLESS_AUTH=$(akeyless auth \
     --access-id "$AKEYLESS_ACCESS_ID" \
     --access-type aws_iam \
-    --url https://api.akeyless.io 2>/dev/null | jq -r '.token // .access_token // .' | head -1) || {
-    echo "Akeyless authentication failed"
+    --url https://api.akeyless.io 2>&1) || {
+    echo "ERROR: Akeyless authentication failed"
+    echo "       Response: $AKEYLESS_AUTH"
     exit 1
   }
   
-  if [[ -z "$AKEYLESS_TOKEN" ]]; then
-    echo "Failed to get Akeyless token"
+  AKEYLESS_TOKEN=$(echo "$AKEYLESS_AUTH" | jq -r '.token // .access_token // .' 2>/dev/null | head -1)
+  
+  if [[ -z "$AKEYLESS_TOKEN" ]] || [[ "$AKEYLESS_TOKEN" == "null" ]]; then
+    echo "ERROR: Failed to extract Akeyless token from response"
+    echo "       Response: $AKEYLESS_AUTH"
     exit 1
   fi
+  echo "✓ Akeyless authentication successful"
   
   # Fetch EV code signing dynamic secret
-  echo "Fetching EV code signing credentials from Akeyless"
+  echo "Fetching EV code signing secret from Akeyless..."
   DYNAMIC_SECRET=$(akeyless dynamic-secret get-value \
     --name "/DevOps/EvCodeSign/evcodesignservice" \
     --token "$AKEYLESS_TOKEN" \
-    --url https://api.akeyless.io 2>/dev/null) || {
-    echo "Failed to fetch dynamic secret"
+    --url https://api.akeyless.io 2>&1) || {
+    echo "ERROR: Failed to fetch dynamic secret"
+    echo "       Response: $DYNAMIC_SECRET"
     exit 1
   }
   
   # Extract Azure credentials from dynamic secret
-  AZURE_TENANT_ID=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.tenantId // empty')
-  AZURE_CLIENT_ID=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.appId // empty')
-  AZURE_CLIENT_SECRET=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.secretText // empty')
+  echo "Extracting Azure credentials from dynamic secret..."
+  AZURE_TENANT_ID=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.tenantId // empty' 2>/dev/null)
+  AZURE_CLIENT_ID=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.appId // empty' 2>/dev/null)
+  AZURE_CLIENT_SECRET=$(echo "$DYNAMIC_SECRET" | jq -r '.secret.secretText // empty' 2>/dev/null)
   
   if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
-    echo "Dynamic secret missing required Azure fields"
+    echo "ERROR: Dynamic secret missing required Azure fields"
+    echo "       Expected fields: tenantId, appId, secretText"
+    echo "       Response: $DYNAMIC_SECRET"
     exit 1
   fi
+  echo "✓ All Azure credentials extracted successfully"
   
-  # Write Azure credentials to file for omnibus-buildkite-plugin to pick up
-  cat > "$AZURE_ENV_FILE" << 'EOF_AZURE'
+  # Export Azure credentials to buildkite environment (persists to Docker)
+  # Using BUILDKITE_ENV_FILE ensures variables are available to docker plugin
+  if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
+    cat >> "$BUILDKITE_ENV_FILE" << EOF_AZURE
 export AZURE_TENANT_ID="$AZURE_TENANT_ID"
 export AZURE_CLIENT_ID="$AZURE_CLIENT_ID"
 export AZURE_CLIENT_SECRET="$AZURE_CLIENT_SECRET"
 export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
 export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
 EOF_AZURE
+    echo "✓ Azure credentials persisted to BUILDKITE_ENV_FILE for Docker"
+  fi
   
-  # Also export for current session
+  # Also export for current bash session (for downstream steps in same shell)
   export AZURE_TENANT_ID
   export AZURE_CLIENT_ID
   export AZURE_CLIENT_SECRET
   export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
   export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
   
-  echo "Progress EV code signing credentials written to $AZURE_ENV_FILE and exported"
+  echo "✓ Azure credentials exported (TENANT_ID, CLIENT_ID, CERT_NAME, VAULT_URL)"
+  echo "  Ready for omnibus_chef_build.ps1 in Docker container"
 fi
 
