@@ -79,15 +79,16 @@ function Initialize-ProgressSigning {
     Write-Output "[OK] dotnet SDK available"
     
     # Install dotnet sign tool if needed
-    if (-not (Get-Command dotnet-sign -ErrorAction SilentlyContinue)) {
-        Write-Output "Installing dotnet sign tool (latest prerelease)"
-        dotnet tool install -g dotnet-sign --prerelease
+    $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+    if (-not (Get-Command sign -ErrorAction SilentlyContinue)) {
+        Write-Output "Installing sign tool (Progress EV Code Signing)"
+        dotnet tool install --global sign --prerelease
         if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to install dotnet sign tool"
+            Write-Error "Failed to install sign tool"
             exit 1
         }
     } else {
-        Write-Output "[OK] dotnet sign tool already available"
+        Write-Output "[OK] sign tool already available"
     }
     
     # Install/Verify Azure CLI is available
@@ -185,8 +186,8 @@ function Sign-ChefPackage {
         }
         Write-Output "[OK] Azure login successful"
         
-        # Sign MSI using dotnet sign
-        Write-Output "Signing with dotnet sign"
+        # Sign MSI using sign tool (Progress EV Code Signing)
+        Write-Output "Signing MSI with sign tool"
         $keyVaultUrl = $env:OMNIBUS_AZURE_KEY_VAULT_URL
         $certificateName = $env:OMNIBUS_AZURE_CERT_NAME
         $timestampServers = @(
@@ -197,19 +198,29 @@ function Sign-ChefPackage {
         )
         
         $signed = $false
-        foreach ($ts in $timestampServers) {
-            Write-Output "  Trying timestamp server: $ts"
-            dotnet sign code azure-key-vault `
-                --file "$msiPath" `
-                --timestamp-url "$ts" `
-                --azure-key-vault-url "$keyVaultUrl" `
-                --azure-key-vault-certificate "$certificateName" 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                Write-Output "[OK] Signed successfully using timestamp server: $ts"
-                $signed = $true
-                break
+        try {
+            foreach ($ts in $timestampServers) {
+                Write-Output "  Trying timestamp server: $ts"
+                & sign code azure-key-vault "$msiPath" `
+                    -d "Chef" `
+                    -u "https://www.chef.io" `
+                    -kvu $keyVaultUrl `
+                    -kvc $certificateName `
+                    -fd sha256 `
+                    -td sha256 `
+                    -t $ts 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Output "[OK] Signed successfully using timestamp server: $ts"
+                    $signed = $true
+                    break
+                }
+                Write-Output "  Timestamp server $ts failed, trying next..."
             }
-            Write-Output "  Timestamp server $ts failed, trying next..."
+        } finally {
+            # Always clear credential env vars regardless of signing outcome
+            Remove-Item Env:AZURE_TENANT_ID -ErrorAction SilentlyContinue
+            Remove-Item Env:AZURE_CLIENT_ID -ErrorAction SilentlyContinue
+            Remove-Item Env:AZURE_CLIENT_SECRET -ErrorAction SilentlyContinue
         }
         
         if (-not $signed) {
