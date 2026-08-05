@@ -68,7 +68,7 @@ function Initialize-ProgressSigning {
 
     Write-Output "Initializing Progress EV code signing credentials"
 
-    # Check if Azure credentials already initialized (from omnibus-buildkite-plugin pre-initialization)
+    # Check if Azure credentials already initialized (from pre-command hook or environment)
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
@@ -82,24 +82,68 @@ function Initialize-ProgressSigning {
         return
     }
 
-    # Credentials not pre-initialized
-    # This should not happen in Docker - omnibus-buildkite-plugin/commands/build.ps1 
-    # must run on the host and pre-fetch credentials
-    throw @"
-Azure credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET) are not initialized.
+    # Fetch credentials from Akeyless
+    Write-Output "Fetching Progress EV credentials from Akeyless"
+    
+    try {
+        # Download Akeyless CLI if needed
+        if (-not (Test-Path $AkeylessExe)) {
+            Write-Output "Downloading Akeyless CLI"
+            $AkeylessUrl = "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe"
+            Invoke-WebRequest -Uri $AkeylessUrl -OutFile $AkeylessExe -UseBasicParsing
+        }
 
-Progress EV code signing requires credentials to be pre-fetched by omnibus-buildkite-plugin/commands/build.ps1
-on the host machine and passed to the Docker container via .omnibus-buildkite-plugin/build-settings.ps1.
+        # Fetch access ID from Parameter Store
+        $akeylessAccessId = if ($env:AKEYLESS_ACCESS_ID) {
+            $env:AKEYLESS_ACCESS_ID.Trim()
+        } else {
+            Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store"
+            $region = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
+            (aws ssm get-parameter --name "buildkite-akeyless-access-id" --with-decryption --region $region --query "Parameter.Value" --output text 2>&1).Trim()
+        }
+        
+        if ([string]::IsNullOrWhiteSpace($akeylessAccessId)) {
+            throw "Failed to get AKEYLESS_ACCESS_ID from environment or Parameter Store"
+        }
 
-This is a configuration issue. Please verify:
-1. omnibus-buildkite-plugin version is recent (with Progress EV credential support)
-2. omnibus-buildkite-plugin/commands/build.ps1 ran before Docker container started
-3. .omnibus-buildkite-plugin/build-settings.ps1 exists and contains AZURE_* credentials
-4. Docker has .omnibus-buildkite-plugin directory mounted or copied
+        # Authenticate to Akeyless
+        Write-Output "Authenticating to Akeyless (aws_iam)"
+        $authOutput = & $AkeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Akeyless auth failed: $authOutput"
+        }
+        
+        $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
+        if (-not $tokenMatch) {
+            throw "Could not extract Akeyless token from auth output"
+        }
+        $akeylessToken = $tokenMatch.Matches[0].Groups[1].Value
 
-For debugging, check if .omnibus-buildkite-plugin/build-settings.ps1 exists:
-  Test-Path './.omnibus-buildkite-plugin/build-settings.ps1'
-"@
+        # Fetch dynamic secret
+        Write-Output "Fetching EV code signing credentials from Akeyless"
+        $dsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $akeylessToken 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to fetch dynamic secret: $dsJson"
+        }
+        
+        $ds = ($dsJson | ConvertFrom-Json).secret
+        
+        if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or [string]::IsNullOrWhiteSpace($ds.appId) -or [string]::IsNullOrWhiteSpace($ds.secretText)) {
+            throw "Dynamic secret missing required Azure fields"
+        }
+
+        $env:AZURE_TENANT_ID = $ds.tenantId
+        $env:AZURE_CLIENT_ID = $ds.appId
+        $env:AZURE_CLIENT_SECRET = $ds.secretText
+        $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
+        $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
+        
+        Write-Output "Successfully retrieved Azure credentials from Akeyless"
+    }
+    catch {
+        Write-Error "Failed to initialize Progress EV credentials: $_"
+        exit 1
+    }
 }
 
 function Sign-ChefPackage {
