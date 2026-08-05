@@ -132,6 +132,21 @@ function Initialize-ProgressSigning {
         $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("PATH", "User")
     }
 
+    # Check if Azure credentials are already initialized (from chef pre-command hook)
+    if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
+        -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
+        -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
+        Write-Output "--- Azure credentials already initialized (from pre-command hook); skipping Akeyless auth"
+        # Ensure omnibus-specific vars are also set
+        if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
+            $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
+        }
+        if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_CERT_NAME)) {
+            $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
+        }
+        return
+    }
+
     # Ensure AWS credentials are active before proceeding with Akeyless AWS IAM auth
     Write-Output "--- Verifying AWS STS identity for Akeyless IAM authentication"
     aws sts get-caller-identity 2>&1 | Out-Null
