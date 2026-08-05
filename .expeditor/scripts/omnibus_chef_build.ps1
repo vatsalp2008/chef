@@ -71,6 +71,13 @@ function Initialize-ProgressSigning {
     # Install required signing tools if not present
     Write-Output "Checking required signing tools"
     
+    # Check if dotnet command is available (needed for dotnet tool install)
+    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
+        Write-Error "dotnet SDK not found in PATH. Cannot install dotnet sign tool."
+        exit 1
+    }
+    Write-Output "[OK] dotnet SDK available"
+    
     # Install dotnet sign tool if needed
     $dotnetSignVersion = "0.9.1-beta.26371.2"
     if (-not (Get-Command dotnet-sign -ErrorAction SilentlyContinue)) {
@@ -84,10 +91,22 @@ function Initialize-ProgressSigning {
         Write-Output "[OK] dotnet sign tool already available"
     }
     
-    # Verify Azure CLI is available
+    # Install/Verify Azure CLI is available
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        Write-Error "Azure CLI not found in PATH. Please ensure Azure CLI is installed."
-        exit 1
+        Write-Output "Installing Azure CLI"
+        # Azure CLI installer: https://aka.ms/installazurecliwindows
+        $azCliInstaller = "$env:TEMP\azure-cli-installer.msi"
+        Write-Output "Downloading Azure CLI installer..."
+        (New-Object System.Net.WebClient).DownloadFile("https://aka.ms/installazurecliwindows", $azCliInstaller)
+        Write-Output "Installing Azure CLI..."
+        Start-Process msiexec.exe -ArgumentList "/i `"$azCliInstaller`" /quiet" -Wait
+        Remove-Item $azCliInstaller -Force
+        
+        # Verify installation
+        if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+            Write-Error "Azure CLI installation failed"
+            exit 1
+        }
     }
     Write-Output "[OK] Azure CLI available"
 
