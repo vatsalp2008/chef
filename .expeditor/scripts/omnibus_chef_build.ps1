@@ -68,19 +68,25 @@ function Initialize-ProgressSigning {
 
     Write-Output "--- Initializing Progress EV code signing"
     
-    # Verify required signing tools are available (pre-installed in Docker container)
-    Write-Output "Verifying required signing tools in Docker container"
+    # Install required signing tools if not present
+    Write-Output "Checking required signing tools"
     
-    # Check if dotnet sign tool is available (pre-installed in chefes/omnibus-toolchain-windows-2019:3.0.39)
+    # Install dotnet sign tool if needed
+    $dotnetSignVersion = "0.9.1-beta.26371.2"
     if (-not (Get-Command dotnet-sign -ErrorAction SilentlyContinue)) {
-        Write-Error "dotnet sign tool not found. It should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
-        exit 1
+        Write-Output "Installing dotnet sign tool v$dotnetSignVersion"
+        dotnet tool install -g dotnet-sign --version $dotnetSignVersion
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to install dotnet sign tool"
+            exit 1
+        }
+    } else {
+        Write-Output "[OK] dotnet sign tool already available"
     }
-    Write-Output "[OK] dotnet sign tool available"
     
-    # Verify Azure CLI is available (pre-installed in Docker image)
+    # Verify Azure CLI is available
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        Write-Error "Azure CLI not found. It should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
+        Write-Error "Azure CLI not found in PATH. Please ensure Azure CLI is installed."
         exit 1
     }
     Write-Output "[OK] Azure CLI available"
