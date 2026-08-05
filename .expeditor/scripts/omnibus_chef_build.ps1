@@ -68,47 +68,81 @@ function Initialize-ProgressSigning {
 
     Write-Output "--- Initializing Progress EV code signing"
     
-    # Install required signing tools if not present
-    Write-Output "Checking required signing tools"
+    Write-Output "Checking required signing tools (pre-installed in Docker image)"
     
-    # Check if dotnet command is available (needed for dotnet tool install)
+    # Search for tools in common locations and add to PATH
+    $toolSearchPaths = @(
+        "C:\Program Files\dotnet",
+        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin",
+        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\Scripts",
+        "C:\opscode\omnibus-toolchain\bin",
+        "C:\opscode\omnibus-toolchain\embedded\bin",
+        "C:\Users\$env:USERNAME\AppData\Local\Programs\Python\Python*\Scripts",
+        "$env:USERPROFILE\.dotnet\tools",
+        "$env:LocalAppData\Programs\Akeyless",
+        "C:\Akeyless"
+    )
+    
+    Write-Output "Searching for tools in:"
+    foreach ($searchPath in $toolSearchPaths) {
+        if (Test-Path $searchPath) {
+            Write-Output "  Found: $searchPath"
+            if ($env:PATH -notlike "*$searchPath*") {
+                $env:PATH = "$searchPath;$env:PATH"
+            }
+        }
+    }
+    
+    # Search for az.exe specifically
+    Write-Output "Locating Azure CLI..."
+    $azPaths = @(
+        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.exe",
+        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\Scripts\az.bat"
+    )
+    foreach ($path in $azPaths) {
+        if (Test-Path $path) {
+            Write-Output "  Found Azure CLI at: $path"
+            $azDir = Split-Path $path
+            if ($env:PATH -notlike "*$azDir*") {
+                $env:PATH = "$azDir;$env:PATH"
+            }
+            break
+        }
+    }
+    
+    # Verify dotnet is available
+    Write-Output "Verifying dotnet SDK..."
     if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-        Write-Error "dotnet SDK not found in PATH. Cannot install dotnet sign tool."
+        Write-Error "dotnet SDK not found in PATH"
         exit 1
     }
-    Write-Output "[OK] dotnet SDK available"
+    Write-Output "[OK] dotnet: $(dotnet --version)"
     
-    # Install dotnet sign tool if needed
-    $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+    # Verify sign tool is available (pre-installed in Docker)
+    Write-Output "Verifying sign tool..."
     if (-not (Get-Command sign -ErrorAction SilentlyContinue)) {
-        Write-Output "Installing sign tool (Progress EV Code Signing)"
-        dotnet tool install --global sign --prerelease
-        if ($LASTEXITCODE -ne 0) {
-            Write-Error "Failed to install sign tool"
-            exit 1
-        }
-    } else {
-        Write-Output "[OK] sign tool already available"
+        Write-Error "sign tool not found. Tools should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
+        Write-Error "Current PATH:"
+        $env:PATH -split ';' | ForEach-Object { Write-Error "  $_" }
+        exit 1
     }
+    Write-Output "[OK] sign tool: $(sign --version 2>&1 | Select-Object -First 1)"
     
-    # Install/Verify Azure CLI is available
+    # Verify Azure CLI is available (pre-installed in Docker)
+    Write-Output "Verifying Azure CLI..."
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        Write-Output "Installing Azure CLI"
-        # Azure CLI installer: https://aka.ms/installazurecliwindows
-        $azCliInstaller = "$env:TEMP\azure-cli-installer.msi"
-        Write-Output "Downloading Azure CLI installer..."
-        (New-Object System.Net.WebClient).DownloadFile("https://aka.ms/installazurecliwindows", $azCliInstaller)
-        Write-Output "Installing Azure CLI..."
-        Start-Process msiexec.exe -ArgumentList "/i `"$azCliInstaller`" /quiet" -Wait
-        Remove-Item $azCliInstaller -Force
-        
-        # Verify installation
-        if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-            Write-Error "Azure CLI installation failed"
-            exit 1
-        }
+        Write-Error "Azure CLI not found. Should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
+        exit 1
     }
-    Write-Output "[OK] Azure CLI available"
+    Write-Output "[OK] Azure CLI: $(az --version 2>&1 | Select-Object -First 1)"
+    
+    # Verify Akeyless CLI is available (pre-installed in Docker)
+    Write-Output "Verifying Akeyless CLI..."
+    if (-not (Get-Command akeyless -ErrorAction SilentlyContinue)) {
+        Write-Warning "Akeyless CLI not found (may not be needed for Chef-18 as credentials pre-fetched)"
+    } else {
+        Write-Output "[OK] Akeyless CLI: $(akeyless --version 2>&1 | Select-Object -First 1)"
+    }
 
     Write-Output "--- Checking Progress EV code signing credentials"
 
