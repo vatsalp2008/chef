@@ -66,7 +66,32 @@ function Initialize-ProgressSigning {
     [CmdletBinding()]
     param()
 
-    Write-Output "--- Initializing Progress EV code signing credentials"
+    Write-Output "--- Initializing Progress EV code signing"
+    
+    # Install required signing tools
+    Write-Output "Verifying required signing tools"
+    
+    # Install dotnet sign tool if needed
+    $dotnetSignVersion = "0.9.1-beta.26371.2"
+    if (-not (Get-Command dotnet-sign -ErrorAction SilentlyContinue)) {
+        Write-Output "Installing dotnet sign tool v$dotnetSignVersion"
+        dotnet tool install -g dotnet-sign --version $dotnetSignVersion --prerelease
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "Failed to install dotnet sign tool"
+            exit 1
+        }
+    } else {
+        Write-Output "[OK] dotnet sign tool already installed"
+    }
+    
+    # Verify Azure CLI is available
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        Write-Error "Azure CLI not found. It should be pre-installed in the Docker container."
+        exit 1
+    }
+    Write-Output "[OK] Azure CLI available"
+
+    Write-Output "--- Checking Progress EV code signing credentials"
 
     # Check if Azure credentials already initialized (pre-fetched on host, passed via env or .omnibus-buildkite-plugin/build-settings.ps1)
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
@@ -155,14 +180,12 @@ function Sign-ChefPackage {
         
         $signed = $false
         foreach ($ts in $timestampServers) {
-            & sign code azure-key-vault $msiPath `
-                -d "Chef Infra Client" `
-                -u "https://www.chef.io" `
-                -kvu $keyVaultUrl `
-                -kvc $certificateName `
-                -fd sha256 `
-                -td sha256 `
-                -t $ts 2>&1 | Out-Null
+            Write-Output "  Trying timestamp server: $ts"
+            dotnet sign code azure-key-vault `
+                --file "$msiPath" `
+                --timestamp-url "$ts" `
+                --azure-key-vault-url "$keyVaultUrl" `
+                --azure-key-vault-certificate "$certificateName" 2>&1
             if ($LASTEXITCODE -eq 0) {
                 Write-Output "[OK] Signed successfully using timestamp server: $ts"
                 $signed = $true
