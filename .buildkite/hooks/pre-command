@@ -266,27 +266,27 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   fi
   echo "✓ All Azure credentials extracted successfully"
   
-  # Export Azure credentials to buildkite environment (persists to Docker)
-  # Using BUILDKITE_ENV_FILE ensures variables are available to docker plugin
-  if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
-    cat >> "$BUILDKITE_ENV_FILE" << EOF_AZURE
-export AZURE_TENANT_ID="$AZURE_TENANT_ID"
-export AZURE_CLIENT_ID="$AZURE_CLIENT_ID"
-export AZURE_CLIENT_SECRET="$AZURE_CLIENT_SECRET"
-export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
-export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
-EOF_AZURE
-    echo "✓ Azure credentials persisted to BUILDKITE_ENV_FILE for Docker"
-  fi
-  
-  # Also export for current bash session (for downstream steps in same shell)
+  # Export Azure credentials for current bash session
+  # With propagate-environment: true in docker plugin, these will be inherited by container
   export AZURE_TENANT_ID
   export AZURE_CLIENT_ID
   export AZURE_CLIENT_SECRET
   export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
   export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
   
-  echo "✓ Azure credentials exported (TENANT_ID, CLIENT_ID, CERT_NAME, VAULT_URL)"
+  # Also persist to BUILDKITE_ENV_FILE if available for downstream steps
+  if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
+    cat >> "$BUILDKITE_ENV_FILE" << EOF_AZURE
+export AZURE_TENANT_ID="${AZURE_TENANT_ID}"
+export AZURE_CLIENT_ID="${AZURE_CLIENT_ID}"
+export AZURE_CLIENT_SECRET="${AZURE_CLIENT_SECRET}"
+export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
+export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
+EOF_AZURE
+    echo "✓ Azure credentials persisted to BUILDKITE_ENV_FILE"
+  fi
+  
+  echo "✓ Azure credentials exported (TENANT_ID, CLIENT_ID, VAULT_URL, CERT_NAME)"
   echo "  Ready for omnibus_chef_build.ps1 in Docker container"
 fi
 
