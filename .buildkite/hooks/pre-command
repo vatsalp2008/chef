@@ -212,137 +212,121 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   echo "✓ Akeyless access ID fetched: ${AKEYLESS_ACCESS_ID:0:20}..."
   export AKEYLESS_ACCESS_ID
   
-  # Use PowerShell to invoke Akeyless CLI (Windows native, more reliable than bash curl)
-  # This mirrors the chef-installer-scripts pattern exactly
+  # Use PowerShell to invoke Akeyless CLI (mirrors chef-installer-scripts pattern)
   echo "Authenticating to Akeyless with AWS IAM method (via PowerShell)..."
   
-  # Create temporary PowerShell script file with .ps1 extension from the start
-  PSCRIPT="/tmp/akeyless-auth-$$.ps1"
-  cat > "$PSCRIPT" << 'PSEOF'
-$AkeylessInstallDir = "$env:USERPROFILE\.akeyless\bin"
-$AkeylessExe = "$AkeylessInstallDir\akeyless.exe"
+  # Create temporary PowerShell script with .ps1 extension
+  PSCRIPT="/tmp/akeyless-fetch-creds-$$.ps1"
+  cat > "$PSCRIPT" << 'POWERSHELLEOF'
+$AkeylessDir = "$env:USERPROFILE\.akeyless\bin"
+$AkeylessExe = "$AkeylessDir\akeyless.exe"
 
-# Install Akeyless CLI if not present
+# Install Akeyless CLI if missing
 if (-not (Test-Path $AkeylessExe)) {
   Write-Host "Installing Akeyless CLI..."
-  
-  $AkeylessDownloadDir = "C:\Tools\Akeyless"
-  $AkeylessDownloadPath = "$AkeylessDownloadDir\akeyless.exe"
-  
-  New-Item -ItemType Directory -Force -Path $AkeylessDownloadDir | Out-Null
-  
-  # Download from official Akeyless S3
-  $AkeylessUrl = "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe"
+  New-Item -ItemType Directory -Force -Path "C:\Tools\Akeyless" | Out-Null
+  $DownloadPath = "C:\Tools\Akeyless\akeyless.exe"
   
   try {
-    (New-Object Net.WebClient).DownloadFile($AkeylessUrl, $AkeylessDownloadPath)
+    (New-Object Net.WebClient).DownloadFile(
+      "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe",
+      $DownloadPath
+    )
   } catch {
     Write-Error "Failed to download Akeyless CLI: $_"
     exit 1
   }
   
-  # Akeyless CLI requires first-time initialization - complete it silently
-  Write-Host "Initializing Akeyless CLI..."
-  cmd /c "echo n | `"$AkeylessDownloadPath`" --version" | Out-Null
+  # Complete Akeyless first-time initialization
+  cmd /c "echo n | `"$DownloadPath`" --version" | Out-Null
   Start-Sleep -Seconds 3
   
-  # Verify it moved to the expected location
   if (-not (Test-Path $AkeylessExe)) {
-    Write-Error "Akeyless installation failed - binary not found at: $AkeylessExe"
+    Write-Error "Akeyless installation failed - binary not at $AkeylessExe"
     exit 1
   }
-  
-  Write-Host "✓ Akeyless CLI installed successfully"
+  Write-Host "Akeyless CLI installed successfully"
 }
 
-# Add to PATH if not already there
-if ($env:PATH -notlike "*$AkeylessInstallDir*") {
-  $env:PATH = "$AkeylessInstallDir;$env:PATH"
+# Ensure Akeyless is in PATH
+if ($env:PATH -notlike "*$AkeylessDir*") {
+  $env:PATH = "$AkeylessDir;$env:PATH"
 }
 
-# Authenticate with aws_iam method
-$authOutput = & $AkeylessExe auth --access-id $env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1
+# Authenticate to Akeyless
+$AuthOutput = & $AkeylessExe auth --access-id $env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1
 if ($LASTEXITCODE -ne 0) {
-  Write-Error "Akeyless auth failed: $authOutput"
+  Write-Error "Akeyless auth failed: $AuthOutput"
   exit 1
 }
 
-# Extract token from output
-$tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
-if (-not $tokenMatch) {
-  Write-Error "Could not extract Akeyless token. Output: $authOutput"
+# Extract token
+$TokenMatch = $AuthOutput | Select-String 'Token:\s+(\S+)'
+if (-not $TokenMatch) {
+  Write-Error "Could not extract Akeyless token"
   exit 1
 }
-$token = $tokenMatch.Matches[0].Groups[1].Value
+$Token = $TokenMatch.Matches[0].Groups[1].Value
 
 # Fetch dynamic secret
-$dsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $token 2>&1
+$DsJson = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $Token 2>&1
 if ($LASTEXITCODE -ne 0) {
-  Write-Error "Failed to fetch EV code signing dynamic secret: $dsJson"
+  Write-Error "Failed to fetch dynamic secret: $DsJson"
   exit 1
 }
 
-# Parse and export Azure credentials
-$ds = $dsJson | ConvertFrom-Json
-$creds = @{
-  AZURE_TENANT_ID = $ds.secret.tenantId
-  AZURE_CLIENT_ID = $ds.secret.appId
-  AZURE_CLIENT_SECRET = $ds.secret.secretText
+# Parse credentials
+$Ds = $DsJson | ConvertFrom-Json
+$TenantId = $Ds.secret.tenantId
+$ClientId = $Ds.secret.appId
+$ClientSecret = $Ds.secret.secretText
+
+if (-not $TenantId -or -not $ClientId -or -not $ClientSecret) {
+  Write-Error "Missing Azure credentials in dynamic secret"
+  exit 1
 }
 
-# Validate all credentials present
-foreach ($key in $creds.Keys) {
-  if ([string]::IsNullOrWhiteSpace($creds[$key])) {
-    Write-Error "Missing credential: $key"
-    exit 1
-  }
-}
+# Output for bash eval
+Write-Host "AZURE_TENANT_ID=$TenantId"
+Write-Host "AZURE_CLIENT_ID=$ClientId"
+Write-Host "AZURE_CLIENT_SECRET=$ClientSecret"
+POWERSHELLEOF
 
-# Output as shell export format
-Write-Output "AZURE_TENANT_ID=$($creds.AZURE_TENANT_ID)"
-Write-Output "AZURE_CLIENT_ID=$($creds.AZURE_CLIENT_ID)"
-Write-Output "AZURE_CLIENT_SECRET=$($creds.AZURE_CLIENT_SECRET)"
-PSEOF
-
+  # Execute PowerShell script and capture credentials
   CREDS=$(powershell -NoProfile -File "$PSCRIPT" 2>&1) || {
-    echo "ERROR: PowerShell Akeyless credential fetch failed:"
+    echo "ERROR: Failed to fetch credentials from PowerShell:"
     echo "$CREDS"
     rm -f "$PSCRIPT"
     exit 1
   }
   rm -f "$PSCRIPT"
   
-  # Parse PowerShell output and export to bash environment
-  eval "$CREDS"
+  # Parse output and export
+  eval "$(echo "$CREDS" | grep '^AZURE_')"
   
   if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
-    echo "ERROR: Failed to extract Azure credentials from PowerShell output"
-    echo "Parsed output: $CREDS"
+    echo "ERROR: Failed to extract Azure credentials"
     exit 1
   fi
-  echo "✓ All Azure credentials extracted successfully"
   
-  # Export for Docker container (propagate-environment: true in docker plugin config)
-  export AZURE_TENANT_ID
-  export AZURE_CLIENT_ID
-  export AZURE_CLIENT_SECRET
+  echo "✓ Azure credentials retrieved successfully"
+  export AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET
   export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
   export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
   
-  # Also write to BUILDKITE_ENV_FILE for downstream step persistence
+  # Persist to BUILDKITE_ENV_FILE if available
   if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
     {
-      echo "export AZURE_TENANT_ID='${AZURE_TENANT_ID}'"
-      echo "export AZURE_CLIENT_ID='${AZURE_CLIENT_ID}'"
-      echo "export AZURE_CLIENT_SECRET='${AZURE_CLIENT_SECRET}'"
+      echo "export AZURE_TENANT_ID='$AZURE_TENANT_ID'"
+      echo "export AZURE_CLIENT_ID='$AZURE_CLIENT_ID'"
+      echo "export AZURE_CLIENT_SECRET='$AZURE_CLIENT_SECRET'"
       echo "export OMNIBUS_AZURE_KEY_VAULT_URL='https://caps-evcodesign-useast.vault.azure.net'"
       echo "export OMNIBUS_AZURE_CERT_NAME='psc-evcodesign'"
     } >> "$BUILDKITE_ENV_FILE"
-    echo "✓ Credentials persisted to BUILDKITE_ENV_FILE"
   fi
   
-  echo "✓ Progress EV credentials ready for omnibus_chef_build.ps1"
+  echo "✓ Progress EV credentials ready for Docker"
 elif [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]]; then
-  echo "--- Skipping Progress EV credentials (not chef/chef-canary org)"
+  echo "Skipping Progress EV credentials (not chef org)"
 fi
 
