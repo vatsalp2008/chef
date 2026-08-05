@@ -215,10 +215,14 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # AWS credentials are already set from EC2 instance metadata
   echo "DEBUG: Authenticating with access_id: ${AKEYLESS_ACCESS_ID:0:20}..."
   
-  AKEYLESS_AUTH=$(curl -sX POST \
+  # Use jq to properly construct JSON payload with correct escaping
+  AKEYLESS_AUTH=$(jq -n \
+    --arg id "$AKEYLESS_ACCESS_ID" \
+    '{access_id: $id, access_type: "aws_iam"}' | \
+    curl -sX POST \
     "https://api.akeyless.io/auth" \
     -H "Content-Type: application/json" \
-    --data-raw "{\"access_id\":\"${AKEYLESS_ACCESS_ID}\",\"access_type\":\"aws_iam\"}" 2>/dev/null) || {
+    -d @- 2>/dev/null) || {
     echo "ERROR: Akeyless auth API call failed"
     exit 1
   }
@@ -246,11 +250,14 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # Fetch EV code signing dynamic secret via API
   echo "Fetching EV code signing secret from Akeyless..."
   
-  DYNAMIC_SECRET=$(curl -sX POST \
+  # Use jq to properly construct JSON payload with correct escaping
+  DYNAMIC_SECRET=$(jq -n \
+    '{name: "/DevOps/EvCodeSign/evcodesignservice"}' | \
+    curl -sX POST \
     "https://api.akeyless.io/dynamic-secret-get-value" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $AKEYLESS_TOKEN" \
-    --data-raw "{\"name\":\"/DevOps/EvCodeSign/evcodesignservice\"}" 2>/dev/null) || {
+    -d @- 2>/dev/null) || {
     echo "ERROR: Failed to fetch dynamic secret"
     exit 1
   }
