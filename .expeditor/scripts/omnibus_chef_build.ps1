@@ -66,9 +66,9 @@ function Initialize-ProgressSigning {
     [CmdletBinding()]
     param()
 
-    Write-Output "Initializing Progress EV code signing credentials"
+    Write-Output "--- Initializing Progress EV code signing credentials"
 
-    # Check if Azure credentials already initialized (from environment)
+    # Check if Azure credentials already initialized (pre-fetched on host, passed via env or .omnibus-buildkite-plugin/build-settings.ps1)
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
         -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
@@ -79,89 +79,33 @@ function Initialize-ProgressSigning {
         if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_CERT_NAME)) {
             $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
         }
+        Write-Output "[OK] Using pre-initialized Azure credentials"
         return
     }
 
-    # Fetch credentials from Akeyless (self-contained for Docker builds)
-    Write-Output "Fetching Progress EV credentials from Akeyless"
-    
-    try {
-        # Download Akeyless CLI if needed
-        if (-not (Test-Path $AkeylessExe)) {
-            Write-Output "Downloading Akeyless CLI"
-            $AkeylessUrl = "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe"
-            Invoke-WebRequest -Uri $AkeylessUrl -OutFile $AkeylessExe -UseBasicParsing
-        }
+    # Credentials not pre-initialized
+    # For Chef-18: Credentials should be pre-fetched on host (Windows 2019 agent) 
+    # via chef/.buildkite/hooks/pre-command and passed as env vars
+    Write-Error @"
+Azure credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET) are not initialized.
 
-        # Get AWS region (default to us-west-2 for Parameter Store access)
-        $awsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
+For Chef-18 builds, Progress EV credentials must be pre-fetched on the Windows host
+and passed to the Docker container as environment variables.
 
-        # Fetch access ID from Parameter Store
-        $akeylessAccessId = if ($env:AKEYLESS_ACCESS_ID) {
-            $env:AKEYLESS_ACCESS_ID.Trim()
-        } else {
-            Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store (region: $awsRegion)"
-            $paramOutput = aws ssm get-parameter `
-                --name "buildkite-akeyless-access-id" `
-                --with-decryption `
-                --region $awsRegion `
-                --query "Parameter.Value" `
-                --output text 2>&1
-            
-            if ($LASTEXITCODE -ne 0) {
-                throw "AWS Parameter Store access failed: $paramOutput"
-            }
-            $paramOutput.Trim()
-        }
-        
-        if ([string]::IsNullOrWhiteSpace($akeylessAccessId)) {
-            throw "AKEYLESS_ACCESS_ID is empty"
-        }
+This should happen in chef/.buildkite/hooks/pre-command hook which:
+1. Detects build-windows step
+2. Fetches AKEYLESS_ACCESS_ID from AWS Parameter Store
+3. Authenticates to Akeyless (aws_iam)
+4. Fetches dynamic secret with Azure credentials
+5. Exports AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
 
-        # Authenticate to Akeyless using AWS IAM
-        Write-Output "Authenticating to Akeyless (aws_iam)"
-        $authOutput = & $AkeylessExe auth --access-id $akeylessAccessId --access-type aws_iam 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "Akeyless auth failed: $authOutput"
-        }
-        
-        $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
-        if (-not $tokenMatch) {
-            throw "Could not extract Akeyless token from auth response"
-        }
-        $akeylessToken = $tokenMatch.Matches[0].Groups[1].Value
-
-        # Fetch dynamic secret from Akeyless
-        Write-Output "Fetching EV code signing credentials from Akeyless"
-        $dsJson = & $AkeylessExe dynamic-secret get-value `
-            --name "/DevOps/EvCodeSign/evcodesignservice" `
-            --token $akeylessToken 2>&1
-        
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to fetch dynamic secret: $dsJson"
-        }
-        
-        $ds = ($dsJson | ConvertFrom-Json).secret
-        
-        if ([string]::IsNullOrWhiteSpace($ds.tenantId) -or `
-            [string]::IsNullOrWhiteSpace($ds.appId) -or `
-            [string]::IsNullOrWhiteSpace($ds.secretText)) {
-            throw "Dynamic secret missing required Azure fields (tenantId, appId, secretText)"
-        }
-
-        # Set Azure environment variables for dotnet sign tool
-        $env:AZURE_TENANT_ID = $ds.tenantId
-        $env:AZURE_CLIENT_ID = $ds.appId
-        $env:AZURE_CLIENT_SECRET = $ds.secretText
-        $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
-        $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
-        
-        Write-Output "[OK] Azure credentials successfully fetched from Akeyless"
-    }
-    catch {
-        Write-Error "Failed to initialize Progress EV credentials: $_"
-        exit 1
-    }
+For debugging:
+- Check that chef/.buildkite/hooks/pre-command ran successfully
+- Verify Akeyless CLI and AWS CLI are available on the host (Windows 2019 agent)
+- Ensure EC2 instance IAM role has ssm:GetParameter permission
+- Check that Docker receives the AZURE_* environment variables
+"@
+    exit 1
 }
 
 function Sign-ChefPackage {
