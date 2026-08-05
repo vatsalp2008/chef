@@ -247,7 +247,7 @@ then
       cf_version="$CHEF_FOUNDATION_VERSION"
     fi
     echo "  plugins:"
-    echo "  - chef/omnibus#2a8f8cdb2cb7e4eb5255d45d4b054d6ec964b02f:"
+    echo "  - chef/omnibus#2757d8448dbc70b3e8ddda867ae913a4d1567292:"
     echo "      build: chef"
     echo "      chef-foundation-version: $cf_version"
     echo "      config: omnibus/omnibus.rb"
@@ -270,7 +270,7 @@ then
     echo "  agents:"
     [[ $platform == *"arm"* ]] && echo "    queue: omnibus-mac_os_x-12-arm64" || echo "    queue: omnibus-mac_os_x-12-x86_64" || echo "    queue: omnibus-mac_os_x-13-arm64" || echo "    queue: omnibus-mac_os_x-14-arm64"
     echo "  plugins:"
-    echo "  - chef/omnibus#2a8f8cdb2cb7e4eb5255d45d4b054d6ec964b02f:"
+    echo "  - chef/omnibus#2757d8448dbc70b3e8ddda867ae913a4d1567292:"
     echo "      config: omnibus/omnibus.rb"
     [[ $platform == *"arm"* ]] && echo "      remote-host: buildkite-omnibus-mac_os_x-12-arm64" || echo "      remote-host: buildkite-omnibus-mac_os_x-12-x86_64" || echo "      remote-host: buildkite-omnibus-mac_os_x-13-arm64" || echo "      remote-host: buildkite-omnibus-mac_os_x-14-arm64"
     echo "      notarize-macos-package: chef"
@@ -291,7 +291,7 @@ then
   echo "- key: create-build-record"
   echo "  label: \":artifactory: Create Build Record\""
   echo "  plugins:"
-  echo "  - chef/omnibus#2a8f8cdb2cb7e4eb5255d45d4b054d6ec964b02f:"
+  echo "  - chef/omnibus#2757d8448dbc70b3e8ddda867ae913a4d1567292:"
   echo "      create-build-record: chef"
 fi
 
@@ -407,7 +407,7 @@ then
       echo "    omnibus-toolchain: \"*\""
     fi
     echo "  plugins:"
-    echo "  - chef/omnibus#2a8f8cdb2cb7e4eb5255d45d4b054d6ec964b02f:"
+    echo "  - chef/omnibus#2757d8448dbc70b3e8ddda867ae913a4d1567292:"
     echo "      test: chef"
     echo "      test-path: omnibus/omnibus-test.sh"
     echo "      install-dir: \"/opt/chef\""
@@ -433,6 +433,6 @@ then
   echo "- key: promote"
   echo "  label: \":artifactory: Promote to Current\""
   echo "  plugins:"
-  echo "  - chef/omnibus#2a8f8cdb2cb7e4eb5255d45d4b054d6ec964b02f:"
+  echo "  - chef/omnibus#2757d8448dbc70b3e8ddda867ae913a4d1567292:"
   echo "      promote: chef"
 fi
