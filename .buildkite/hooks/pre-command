@@ -211,15 +211,12 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # AWS credentials already set from EC2 instance metadata earlier in this hook
   echo "Authenticating to Akeyless with AWS IAM method..."
   
-  # Build JSON payload for auth request
-  AUTH_PAYLOAD=$(cat <<'EOF'
-{
-  "access_id": "PLACEHOLDER_ACCESS_ID",
-  "access_type": "aws_iam"
-}
-EOF
-  )
-  AUTH_PAYLOAD="${AUTH_PAYLOAD//PLACEHOLDER_ACCESS_ID/$AKEYLESS_ACCESS_ID}"
+  # Build JSON payload for auth request using jq (proper JSON encoding)
+  AUTH_PAYLOAD=$(jq -n \
+    --arg access_id "$AKEYLESS_ACCESS_ID" \
+    '{access_id: $access_id, access_type: "aws_iam"}')
+  
+  echo "DEBUG: Authenticating with access_id: ${AKEYLESS_ACCESS_ID:0:20}..."
   
   AKEYLESS_AUTH=$(curl -sX POST \
     -H "Content-Type: application/json" \
@@ -229,23 +226,21 @@ EOF
     exit 1
   }
   
+  echo "DEBUG: Akeyless response: $(echo "$AKEYLESS_AUTH" | head -c 200)..."
+  
   AKEYLESS_TOKEN=$(echo "$AKEYLESS_AUTH" | jq -r '.token // empty' 2>/dev/null)
   [[ -z "$AKEYLESS_TOKEN" ]] && { 
     echo "ERROR: Failed to extract Akeyless token"
     echo "Response: $AKEYLESS_AUTH"
     exit 1 
   }
-  echo "✓ Akeyless authentication successful"
+  echo "✓ Akeyless authentication successful (token: ${AKEYLESS_TOKEN:0:20}...)"
   
   # Fetch EV code signing dynamic secret via API
   echo "Fetching EV code signing secret from Akeyless..."
   
-  SECRET_PAYLOAD=$(cat <<'EOF'
-{
-  "name": "/DevOps/EvCodeSign/evcodesignservice"
-}
-EOF
-  )
+  SECRET_PAYLOAD=$(jq -n \
+    '{name: "/DevOps/EvCodeSign/evcodesignservice"}')
   
   DYNAMIC_SECRET=$(curl -sX POST \
     -H "Content-Type: application/json" \
@@ -255,6 +250,8 @@ EOF
     echo "ERROR: Failed to fetch dynamic secret"
     exit 1
   }
+  
+  echo "DEBUG: Dynamic secret response: $(echo "$DYNAMIC_SECRET" | head -c 200)..."
   
   # Extract Azure credentials from secret response
   echo "Extracting Azure credentials..."
