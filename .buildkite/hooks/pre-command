@@ -214,11 +214,10 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # Authenticate to Akeyless using aws_iam method
   # AWS credentials are already set from EC2 instance metadata
   echo "DEBUG: Authenticating with access_id: ${AKEYLESS_ACCESS_ID:0:20}..."
+  echo "DEBUG: Using AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:0:10}... and AWS_SECRET_ACCESS_KEY"
   
-  # Use jq to properly construct JSON payload with correct escaping
-  AKEYLESS_AUTH=$(jq -n \
-    --arg id "$AKEYLESS_ACCESS_ID" \
-    '{access_id: $id, access_type: "aws_iam"}' | \
+  # Try authentication with just access_id first
+  AKEYLESS_AUTH=$(printf '%s' "{\"access_id\":\"${AKEYLESS_ACCESS_ID}\",\"access_type\":\"aws_iam\"}" | \
     curl -sX POST \
     "https://api.akeyless.io/auth" \
     -H "Content-Type: application/json" \
@@ -227,18 +226,32 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
     exit 1
   }
   
-  echo "DEBUG: Akeyless auth response: $(echo "$AKEYLESS_AUTH" | head -c 300)..."
+  # If that fails with empty access_id error, try explicit AWS credentials in request
+  if echo "$AKEYLESS_AUTH" | grep -q '"error".*access.*id.*empty'; then
+    echo "DEBUG: Retrying with explicit AWS credentials in request..."
+    AKEYLESS_AUTH=$(printf '%s' "{\"access_id\":\"${AKEYLESS_ACCESS_ID}\",\"access_type\":\"aws_iam\",\"aws_access_key\":\"${AWS_ACCESS_KEY_ID}\",\"aws_secret_key\":\"${AWS_SECRET_ACCESS_KEY}\",\"aws_session_token\":\"${AWS_SESSION_TOKEN}\"}" | \
+      curl -sX POST \
+      "https://api.akeyless.io/auth" \
+      -H "Content-Type: application/json" \
+      -d @- 2>/dev/null) || {
+      echo "ERROR: Akeyless auth API call failed on retry"
+      exit 1
+    }
+  fi
   
-  # Extract token - try both .token and .access_token fields (API may vary)
-  AKEYLESS_TOKEN=$(echo "$AKEYLESS_AUTH" | jq -r '.access_token // .token // empty' 2>/dev/null)
+  echo "DEBUG: Akeyless auth response: $(echo "$AKEYLESS_AUTH" | head -c 500)..."
   
-  # Check for errors in response
-  if echo "$AKEYLESS_AUTH" | jq -e '.error' >/dev/null 2>&1; then
+  # Check for errors in response first (common JSON API pattern)
+  if echo "$AKEYLESS_AUTH" | grep -q '"error"'; then
     ERROR_MSG=$(echo "$AKEYLESS_AUTH" | jq -r '.error // "unknown error"' 2>/dev/null)
     echo "ERROR: Akeyless API error: $ERROR_MSG"
     echo "Full response: $AKEYLESS_AUTH"
+    echo "DEBUG: Check if access_id was properly passed: '${AKEYLESS_ACCESS_ID}'"
     exit 1
   fi
+  
+  # Extract token - try both .token and .access_token fields (API may vary)
+  AKEYLESS_TOKEN=$(echo "$AKEYLESS_AUTH" | jq -r '.access_token // .token // empty' 2>/dev/null)
   
   [[ -z "$AKEYLESS_TOKEN" ]] && { 
     echo "ERROR: Failed to extract Akeyless token"
@@ -250,9 +263,8 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # Fetch EV code signing dynamic secret via API
   echo "Fetching EV code signing secret from Akeyless..."
   
-  # Use jq to properly construct JSON payload with correct escaping
-  DYNAMIC_SECRET=$(jq -n \
-    '{name: "/DevOps/EvCodeSign/evcodesignservice"}' | \
+  # Construct JSON payload and pass directly to curl (avoid pipe issues)
+  DYNAMIC_SECRET=$(printf '%s' '{"name":"/DevOps/EvCodeSign/evcodesignservice"}' | \
     curl -sX POST \
     "https://api.akeyless.io/dynamic-secret-get-value" \
     -H "Content-Type: application/json" \
