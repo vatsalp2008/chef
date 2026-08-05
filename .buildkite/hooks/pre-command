@@ -219,13 +219,45 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # Create temporary PowerShell script file with .ps1 extension from the start
   PSCRIPT="/tmp/akeyless-auth-$$.ps1"
   cat > "$PSCRIPT" << 'PSEOF'
-$LocalBin = "$env:USERPROFILE\.local\bin"
-$AkeylessExe = "$LocalBin\akeyless.exe"
+$AkeylessInstallDir = "$env:USERPROFILE\.akeyless\bin"
+$AkeylessExe = "$AkeylessInstallDir\akeyless.exe"
 
-# Test if Akeyless CLI is available
+# Install Akeyless CLI if not present
 if (-not (Test-Path $AkeylessExe)) {
-  Write-Error "Akeyless CLI not found at: $AkeylessExe"
-  exit 1
+  Write-Host "Installing Akeyless CLI..."
+  
+  $AkeylessDownloadDir = "C:\Tools\Akeyless"
+  $AkeylessDownloadPath = "$AkeylessDownloadDir\akeyless.exe"
+  
+  New-Item -ItemType Directory -Force -Path $AkeylessDownloadDir | Out-Null
+  
+  # Download from official Akeyless S3
+  $AkeylessUrl = "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe"
+  
+  try {
+    (New-Object Net.WebClient).DownloadFile($AkeylessUrl, $AkeylessDownloadPath)
+  } catch {
+    Write-Error "Failed to download Akeyless CLI: $_"
+    exit 1
+  }
+  
+  # Akeyless CLI requires first-time initialization - complete it silently
+  Write-Host "Initializing Akeyless CLI..."
+  cmd /c "echo n | `"$AkeylessDownloadPath`" --version" | Out-Null
+  Start-Sleep -Seconds 3
+  
+  # Verify it moved to the expected location
+  if (-not (Test-Path $AkeylessExe)) {
+    Write-Error "Akeyless installation failed - binary not found at: $AkeylessExe"
+    exit 1
+  }
+  
+  Write-Host "✓ Akeyless CLI installed successfully"
+}
+
+# Add to PATH if not already there
+if ($env:PATH -notlike "*$AkeylessInstallDir*") {
+  $env:PATH = "$AkeylessInstallDir;$env:PATH"
 }
 
 # Authenticate with aws_iam method
