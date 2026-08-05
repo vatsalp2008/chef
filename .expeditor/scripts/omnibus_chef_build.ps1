@@ -118,15 +118,41 @@ function Initialize-ProgressSigning {
     }
     Write-Output "[OK] dotnet: $(dotnet --version)"
     
+    # Check available .NET runtimes (sign tool may need a specific runtime)
+    Write-Output "Checking available .NET runtimes..."
+    $runtimes = dotnet --list-runtimes 2>&1
+    if ($runtimes) {
+        $runtimes | ForEach-Object { Write-Output "  $_" }
+    } else {
+        Write-Warning "No .NET runtimes detected (this may cause sign tool to fail)"
+    }
+    
+    Write-Output "Checking available .NET SDKs..."
+    $sdks = dotnet --list-sdks 2>&1
+    if ($sdks) {
+        $sdks | ForEach-Object { Write-Output "  $_" }
+    }
+    
     # Verify sign tool is available (pre-installed in Docker)
     Write-Output "Verifying sign tool..."
     if (-not (Get-Command sign -ErrorAction SilentlyContinue)) {
-        Write-Error "sign tool not found. Tools should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
+        Write-Error "sign tool not found in PATH. Tools should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
         Write-Error "Current PATH:"
         $env:PATH -split ';' | ForEach-Object { Write-Error "  $_" }
         exit 1
     }
-    Write-Output "[OK] sign tool: $(sign --version 2>&1 | Select-Object -First 1)"
+    
+    # Try to get sign version (may fail if .NET runtime is missing)
+    Write-Output "Getting sign tool version..."
+    try {
+        $signVersion = sign --version 2>&1
+        Write-Output "[OK] sign tool: $signVersion"
+    } catch {
+        Write-Error "Failed to run sign tool: $_"
+        Write-Error "This may be due to missing .NET runtime. Available runtimes:"
+        dotnet --list-runtimes 2>&1 | ForEach-Object { Write-Error "  $_" }
+        exit 1
+    }
     
     # Verify Azure CLI is available (pre-installed in Docker)
     Write-Output "Verifying Azure CLI..."
