@@ -341,32 +341,3 @@ POWERSHELLEOF
   
   echo "✓ Progress EV credentials ready for Docker (Chef-18 build)"
 fi
-  
-  # Validate that all required Azure credentials were successfully retrieved
-  if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
-    echo "ERROR: Failed to extract Azure credentials from Akeyless"
-    exit 1
-  fi
-  
-  echo "✓ Azure credentials retrieved from Akeyless"
-  
-  # Export credentials and Azure Key Vault configuration for Docker container
-  # These are passed to omnibus-private's windows_base.rb during MSI signing
-  export AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET
-  export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
-  export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
-  
-  # Persist credentials to BUILDKITE_ENV_FILE so they're available in Docker environment
-  # BUILDKITE_ENV_FILE is sourced by the docker-buildkite-plugin before running container
-  if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
-    {
-      echo "export AZURE_TENANT_ID='$AZURE_TENANT_ID'"
-      echo "export AZURE_CLIENT_ID='$AZURE_CLIENT_ID'"
-      echo "export AZURE_CLIENT_SECRET='$AZURE_CLIENT_SECRET'"
-      echo "export OMNIBUS_AZURE_KEY_VAULT_URL='https://caps-evcodesign-useast.vault.azure.net'"
-      echo "export OMNIBUS_AZURE_CERT_NAME='psc-evcodesign'"
-    } >> "$BUILDKITE_ENV_FILE"
-  fi
-  
-  echo "✓ Progress EV credentials ready for Docker (Chef-18 build)"
-fi
