@@ -66,45 +66,30 @@ function Initialize-ProgressSigning {
     [CmdletBinding()]
     param()
 
-    Write-Output "--- Initializing Progress EV code signing"
+    Write-Output "--- Initializing Progress EV code signing (HYBRID: AWS creds from host, Azure from container)"
     
-    # Check if Azure credentials already initialized (pre-fetched on host via .buildkite/hooks/pre-command)
-    # These are passed to Docker as environment variables
+    # Check if Azure credentials already initialized
     if (-not ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
               [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
               [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET))) {
-        Write-Output "[OK] Azure credentials pre-initialized (from pre-command hook)"
+        Write-Output "[OK] Azure credentials already initialized (will use as-is)"
     } else {
-        # BEST PRACTICE: Fetch credentials directly inside Docker container using EC2 IAM role
-        # This is more secure than passing via environment variables from the host
+        # HYBRID APPROACH: Use AWS credentials (from pre-command hook) to fetch Azure credentials inside container
         Write-Output "Azure credentials not pre-initialized; fetching from Akeyless inside container..."
         
         try {
-            # Fetch AWS credentials from EC2 metadata service (available inside Docker)
-            # This uses the IAM role attached to the EC2 instance
-            Write-Output "Fetching AWS credentials from EC2 metadata service..."
-            $TOKEN = Invoke-WebRequest -Uri "http://169.254.169.254/latest/api/token" `
-                -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} `
-                -UseBasicParsing | Select-Object -ExpandProperty Content
+            # Verify AWS credentials are available (should be passed by pre-command hook via BUILDKITE_ENV_FILE)
+            if ([string]::IsNullOrWhiteSpace($env:AWS_ACCESS_KEY_ID) -or `
+                [string]::IsNullOrWhiteSpace($env:AWS_SECRET_ACCESS_KEY)) {
+                throw "AWS credentials not available from pre-command hook (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN)"
+            }
             
-            $ROLE = Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/iam/security-credentials/" `
-                -Headers @{"X-aws-ec2-metadata-token" = $TOKEN} `
-                -UseBasicParsing | Select-Object -ExpandProperty Content
+            Write-Output "✓ AWS credentials available from pre-command hook"
             
-            $RESPONSE = Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE" `
-                -Headers @{"X-aws-ec2-metadata-token" = $TOKEN} `
-                -UseBasicParsing | Select-Object -ExpandProperty Content | ConvertFrom-Json
-            
-            # Set AWS credentials temporarily for aws CLI calls
-            $env:AWS_ACCESS_KEY_ID = $RESPONSE.AccessKeyId
-            $env:AWS_SECRET_ACCESS_KEY = $RESPONSE.SecretAccessKey
-            $env:AWS_SESSION_TOKEN = $RESPONSE.Token
-            
-            # Fetch Akeyless access ID from AWS Parameter Store
-            Write-Output "Fetching AKEYLESS_ACCESS_ID from Parameter Store..."
+            # Fetch Akeyless access ID from AWS Parameter Store using AWS credentials
+            Write-Output "Fetching AKEYLESS_ACCESS_ID from AWS Parameter Store..."
             $awsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
             
-            # Use PowerShell to call aws CLI (pre-installed in container)
             $accessIdOutput = & aws ssm get-parameter `
                 --name "buildkite-akeyless-access-id" `
                 --with-decryption `
@@ -117,22 +102,23 @@ function Initialize-ProgressSigning {
             }
             
             $env:AKEYLESS_ACCESS_ID = $accessIdOutput.Trim()
+            Write-Output "✓ Akeyless access ID fetched successfully"
             
-            # Fetch Azure credentials from Akeyless dynamic secret
+            # Authenticate to Akeyless and fetch Azure credentials
             Write-Output "Authenticating to Akeyless and fetching Azure credentials..."
             $AkeylessExe = "$env:USERPROFILE\.akeyless\bin\akeyless.exe"
             
             if (-not (Test-Path $AkeylessExe)) {
-                throw "Akeyless CLI not found at $AkeylessExe"
+                throw "Akeyless CLI not found at $AkeylessExe (expected pre-installed on Windows agent)"
             }
             
-            # Authenticate to Akeyless via AWS IAM
+            # Authenticate to Akeyless via AWS IAM method
             $authOutput = & $AkeylessExe auth --access-id $env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
                 throw "Akeyless auth failed: $authOutput"
             }
             
-            # Extract token
+            # Extract token from auth output
             $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
             if (-not $tokenMatch) {
                 throw "Could not extract Akeyless token from auth output"
@@ -145,14 +131,14 @@ function Initialize-ProgressSigning {
                 throw "Failed to fetch Akeyless dynamic secret: $dsOutput"
             }
             
-            # Parse credentials
+            # Parse credentials from secret
             $ds = $dsOutput | ConvertFrom-Json
             $dsData = if ($ds.secret) { $ds.secret } else { $ds }
             
             if ([string]::IsNullOrWhiteSpace($dsData.tenantId) -or `
                 [string]::IsNullOrWhiteSpace($dsData.appId) -or `
                 [string]::IsNullOrWhiteSpace($dsData.secretText)) {
-                throw "Dynamic secret missing required Azure credentials"
+                throw "Dynamic secret missing required Azure credentials (tenantId, appId, secretText)"
             }
             
             # Set Azure credentials
@@ -160,12 +146,15 @@ function Initialize-ProgressSigning {
             $env:AZURE_CLIENT_ID = $dsData.appId
             $env:AZURE_CLIENT_SECRET = $dsData.secretText
             
-            Write-Output "[OK] Azure credentials fetched from Akeyless inside container"
+            Write-Output "[OK] Azure credentials fetched successfully from Akeyless inside container"
             
-            # SECURITY: Clear sensitive variables after use
+            # SECURITY: Clear sensitive temporary variables after use (to prevent memory leaks)
             $token = $null
             $authOutput = $null
             $dsOutput = $null
+            $ds = $null
+            $dsData = $null
+            $accessIdOutput = $null
             
         } catch {
             Write-Error "Failed to fetch Azure credentials: $_"
@@ -173,7 +162,8 @@ function Initialize-ProgressSigning {
         }
     }
     
-    # Set OMNIBUS_AZURE_* environment variables for omnibus-private's windows_base.rb to use during signing
+    # Set OMNIBUS_AZURE_* environment variables for omnibus-private's windows_base.rb
+    # These are used during MSI packaging to sign with Progress EV certificate
     if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
         $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
     }
@@ -181,7 +171,7 @@ function Initialize-ProgressSigning {
         $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
     }
     
-    Write-Output "Progress EV signing will be handled by omnibus-private during MSI packaging"
+    Write-Output "Progress EV signing configuration ready for omnibus-private during MSI packaging"
     Write-Output "  OMNIBUS_AZURE_KEY_VAULT_URL = $env:OMNIBUS_AZURE_KEY_VAULT_URL"
     Write-Output "  OMNIBUS_AZURE_CERT_NAME = $env:OMNIBUS_AZURE_CERT_NAME"
 }
@@ -548,30 +538,46 @@ finally {
     # Clean up sensitive environment variables for security
     Write-Output "--- Cleaning up sensitive environment variables"
     $sensitiveEnvVars = @(
+        # Azure credentials (fetched in Initialize-ProgressSigning)
         'AZURE_TENANT_ID',
         'AZURE_CLIENT_ID', 
         'AZURE_CLIENT_SECRET',
         'OMNIBUS_AZURE_KEY_VAULT_URL',
         'OMNIBUS_AZURE_CERT_NAME',
+        
+        # AWS credentials (from pre-command hook for Parameter Store access)
+        'AWS_ACCESS_KEY_ID',
+        'AWS_SECRET_ACCESS_KEY',
+        'AWS_SESSION_TOKEN',
         'AWS_S3_ACCESS_KEY',
         'AWS_S3_SECRET_KEY',
+        
+        # Akeyless credentials
+        'AKEYLESS_ACCESS_ID',
+        
+        # Artifactory credentials
         'ARTIFACTORY_PASSWORD',
         'ARTIFACTORY_API_KEY',
+        
+        # GitHub credentials
         'GITHUB_TOKEN',
-        'GEM_HOST_API_KEY'
+        'GEM_HOST_API_KEY',
+        'OMNIBUS_SUBMODULE_CONFIG_PRIVATE'
     )
     
     foreach ($var in $sensitiveEnvVars) {
         if (Test-Path "env:\$var") {
             Remove-Item -Path "env:\$var" -ErrorAction SilentlyContinue
+            Write-Verbose "Removed env var: $var"
         }
     }
     
-    # Remove .netrc file if it exists
+    # Remove .netrc file if it exists (contains GitHub credentials for bundle)
     $netrcPath = "$env:USERPROFILE\_netrc"
     if (Test-Path $netrcPath) {
         Remove-Item $netrcPath -Force -ErrorAction SilentlyContinue
+        Write-Verbose "Removed .netrc file"
     }
     
-    Write-Output "[OK] Cleanup completed"
+    Write-Output "[OK] Cleanup completed - all sensitive data removed from container"
 }
