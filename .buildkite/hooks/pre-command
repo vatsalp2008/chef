@@ -219,11 +219,40 @@ if [[ "$BUILDKITE_STEP_KEY" =~ ^build-windows ]] && [[ "$BUILDKITE_ORGANIZATION_
   # Create temporary PowerShell script
   PSCRIPT="/tmp/akeyless-fetch-creds-$$.ps1"
   cat > "$PSCRIPT" << 'POWERSHELLEOF'
-$AkeylessExe = "$env:USERPROFILE\.akeyless\bin\akeyless.exe"
+# Download and install Akeyless CLI if needed
+$AkeylessDownloadDir = "C:\Tools\Akeyless"
+New-Item -Path $AkeylessDownloadDir -ItemType Directory -Force | Out-Null
+$AkeylessDownloadPath = "$AkeylessDownloadDir\akeyless.exe"
+
+# After initialization, Akeyless moves itself to user profile
+$AkeylessInstallDir = "$env:USERPROFILE\.akeyless\bin"
+$AkeylessExe = "$AkeylessInstallDir\akeyless.exe"
 
 if (-not (Test-Path $AkeylessExe)) {
-  Write-Error "Akeyless CLI not found at $AkeylessExe (expected to be pre-installed)"
-  exit 1
+  Write-Host "Downloading Akeyless CLI from S3..."
+  try {
+    $AkeylessUrl = "https://akeyless-cli.s3.us-east-2.amazonaws.com/cli/latest/cli-windows-amd64.exe"
+    (New-Object Net.WebClient).DownloadFile($AkeylessUrl, $AkeylessDownloadPath)
+  } catch {
+    Write-Error "Failed to download Akeyless CLI: $_"
+    exit 1
+  }
+  
+  # Run with 'echo n' to suppress interactive prompts on first run
+  Write-Host "Initializing Akeyless CLI (suppressing prompts)..."
+  cmd /c "echo n | `"$AkeylessDownloadPath`" --version" 2>&1 | Out-Null
+  Start-Sleep -Seconds 2
+  
+  if (-not (Test-Path $AkeylessExe)) {
+    Write-Error "Akeyless CLI installation failed: binary not found at $AkeylessExe"
+    exit 1
+  }
+  Write-Host "Akeyless CLI installed successfully"
+}
+
+# Ensure Akeyless bin dir is in PATH
+if ($env:PATH -notlike "*$AkeylessInstallDir*") {
+  $env:PATH = "$AkeylessInstallDir;$env:PATH"
 }
 
 # Authenticate to Akeyless via AWS IAM
@@ -280,6 +309,38 @@ POWERSHELLEOF
   # Extract AZURE_* credential lines from PowerShell output and export to bash environment
   # These credentials are passed to Docker as environment variables for the build
   eval "$(echo "$CREDS" | grep '^AZURE_')"
+  
+  # SECURITY: Clear sensitive variables from bash environment after extracting credentials
+  unset AKEYLESS_ACCESS_ID
+  
+  # Validate that all required Azure credentials were successfully retrieved
+  if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
+    echo "ERROR: Failed to extract Azure credentials from Akeyless"
+    exit 1
+  fi
+  
+  echo "✓ Azure credentials retrieved from Akeyless"
+  
+  # Export credentials and Azure Key Vault configuration for Docker container
+  # These are passed to omnibus-private's windows_base.rb during MSI signing
+  export AZURE_TENANT_ID AZURE_CLIENT_ID AZURE_CLIENT_SECRET
+  export OMNIBUS_AZURE_KEY_VAULT_URL="https://caps-evcodesign-useast.vault.azure.net"
+  export OMNIBUS_AZURE_CERT_NAME="psc-evcodesign"
+  
+  # Persist credentials to BUILDKITE_ENV_FILE so they're available in Docker environment
+  # BUILDKITE_ENV_FILE is sourced by the docker-buildkite-plugin before running container
+  if [[ -n "${BUILDKITE_ENV_FILE:-}" ]]; then
+    {
+      echo "export AZURE_TENANT_ID='$AZURE_TENANT_ID'"
+      echo "export AZURE_CLIENT_ID='$AZURE_CLIENT_ID'"
+      echo "export AZURE_CLIENT_SECRET='$AZURE_CLIENT_SECRET'"
+      echo "export OMNIBUS_AZURE_KEY_VAULT_URL='https://caps-evcodesign-useast.vault.azure.net'"
+      echo "export OMNIBUS_AZURE_CERT_NAME='psc-evcodesign'"
+    } >> "$BUILDKITE_ENV_FILE"
+  fi
+  
+  echo "✓ Progress EV credentials ready for Docker (Chef-18 build)"
+fi
   
   # Validate that all required Azure credentials were successfully retrieved
   if [[ -z "$AZURE_TENANT_ID" ]] || [[ -z "$AZURE_CLIENT_ID" ]] || [[ -z "$AZURE_CLIENT_SECRET" ]]; then
