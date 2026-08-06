@@ -226,30 +226,27 @@ function Ensure-DotNetRuntime {
     [CmdletBinding()]
     param()
 
+    Write-Output "--- Ensuring .NET 8 runtime is available"
+    
     try {
-        Write-Output "--- Ensuring .NET 8 runtime is available"
-        
         # Check if dotnet is already available
-        $dotnetPath = $null
-        try {
-            $dotnetPath = (dotnet --version 2>&1) | Where-Object { $_ -match '8\.' }
-            if ($dotnetPath) {
-                Write-Output "✓ .NET runtime already available: $dotnetPath"
-                return
-            }
-        } catch {
-            Write-Output "dotnet command not found, will attempt installation"
-        }
-        
+        $version = dotnet --version 2>&1 | Out-String
+        Write-Output "[OK] .NET runtime already available: $version"
+        return
+    } catch {
+        Write-Output "dotnet command not found, will attempt installation"
+    }
+    
+    try {
         # Download and install .NET 8 runtime
-        Write-Output "Installing .NET 8 runtime..."
+        Write-Output "Downloading .NET 8 installer..."
         $dotnetInstallerUrl = "https://dot.net/v1/dotnet-install.ps1"
         $dotnetInstallerPath = "$env:TEMP\dotnet-install.ps1"
         
-        # Download installer
         Invoke-WebRequest -Uri $dotnetInstallerUrl -OutFile $dotnetInstallerPath -ErrorAction Stop
         
         # Run installer for .NET 8
+        Write-Output "Installing .NET 8 runtime..."
         & $dotnetInstallerPath -Version "8.0" -InstallDir "$env:ProgramFiles\dotnet" -NoPath -ErrorAction Stop
         
         # Add to PATH
@@ -263,7 +260,7 @@ function Ensure-DotNetRuntime {
         
         # Verify installation
         $version = dotnet --version
-        Write-Output "✓ .NET 8 runtime installed: $version"
+        Write-Output "[OK] .NET 8 runtime installed: $version"
     }
     catch {
         Write-Warning "Failed to ensure .NET runtime: $_"
@@ -438,6 +435,7 @@ function Publish-ToArtifactory {
 try {
     Initialize-ProgressSigning
     Initialize-Environment
+    Ensure-DotNetRuntime
     
     Install-ChefFoundation
     Install-OmnibusDependencies
