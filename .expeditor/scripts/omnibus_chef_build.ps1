@@ -70,33 +70,108 @@ function Initialize-ProgressSigning {
     
     # Check if Azure credentials already initialized (pre-fetched on host via .buildkite/hooks/pre-command)
     # These are passed to Docker as environment variables
-    if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -or `
-        [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -or `
-        [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
-        $tenantIdStatus = if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID)) { "NOT SET" } else { "SET" }
-        $clientIdStatus = if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)) { "NOT SET" } else { "SET" }
-        $secretStatus = if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) { "NOT SET" } else { "SET" }
-        Write-Error @"
-Azure credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET) not found.
-
-These must be pre-fetched on the Windows host via .buildkite/hooks/pre-command:
-  1. Fetch AKEYLESS_ACCESS_ID from AWS Parameter Store
-  2. Authenticate to Akeyless with AWS IAM
-  3. Get dynamic secret from /DevOps/EvCodeSign/evcodesignservice
-  4. Export AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
-
-These env vars are then passed to Docker container for use by omnibus-private's
-windows_base.rb during MSI packaging and signing.
-
-Current state:
-  AZURE_TENANT_ID = $tenantIdStatus
-  AZURE_CLIENT_ID = $clientIdStatus
-  AZURE_CLIENT_SECRET = $secretStatus
-"@
-        exit 1
+    if (-not ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
+              [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
+              [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET))) {
+        Write-Output "[OK] Azure credentials pre-initialized (from pre-command hook)"
+    } else {
+        # BEST PRACTICE: Fetch credentials directly inside Docker container using EC2 IAM role
+        # This is more secure than passing via environment variables from the host
+        Write-Output "Azure credentials not pre-initialized; fetching from Akeyless inside container..."
+        
+        try {
+            # Fetch AWS credentials from EC2 metadata service (available inside Docker)
+            # This uses the IAM role attached to the EC2 instance
+            Write-Output "Fetching AWS credentials from EC2 metadata service..."
+            $TOKEN = Invoke-WebRequest -Uri "http://169.254.169.254/latest/api/token" `
+                -Headers @{"X-aws-ec2-metadata-token-ttl-seconds" = "21600"} `
+                -UseBasicParsing | Select-Object -ExpandProperty Content
+            
+            $ROLE = Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/iam/security-credentials/" `
+                -Headers @{"X-aws-ec2-metadata-token" = $TOKEN} `
+                -UseBasicParsing | Select-Object -ExpandProperty Content
+            
+            $RESPONSE = Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/iam/security-credentials/$ROLE" `
+                -Headers @{"X-aws-ec2-metadata-token" = $TOKEN} `
+                -UseBasicParsing | Select-Object -ExpandProperty Content | ConvertFrom-Json
+            
+            # Set AWS credentials temporarily for aws CLI calls
+            $env:AWS_ACCESS_KEY_ID = $RESPONSE.AccessKeyId
+            $env:AWS_SECRET_ACCESS_KEY = $RESPONSE.SecretAccessKey
+            $env:AWS_SESSION_TOKEN = $RESPONSE.Token
+            
+            # Fetch Akeyless access ID from AWS Parameter Store
+            Write-Output "Fetching AKEYLESS_ACCESS_ID from Parameter Store..."
+            $awsRegion = if ($env:AWS_REGION) { $env:AWS_REGION } else { "us-west-2" }
+            
+            # Use PowerShell to call aws CLI (pre-installed in container)
+            $accessIdOutput = & aws ssm get-parameter `
+                --name "buildkite-akeyless-access-id" `
+                --with-decryption `
+                --region $awsRegion `
+                --query "Parameter.Value" `
+                --output text 2>&1
+            
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to fetch Akeyless access ID from Parameter Store: $accessIdOutput"
+            }
+            
+            $env:AKEYLESS_ACCESS_ID = $accessIdOutput.Trim()
+            
+            # Fetch Azure credentials from Akeyless dynamic secret
+            Write-Output "Authenticating to Akeyless and fetching Azure credentials..."
+            $AkeylessExe = "$env:USERPROFILE\.akeyless\bin\akeyless.exe"
+            
+            if (-not (Test-Path $AkeylessExe)) {
+                throw "Akeyless CLI not found at $AkeylessExe"
+            }
+            
+            # Authenticate to Akeyless via AWS IAM
+            $authOutput = & $AkeylessExe auth --access-id $env:AKEYLESS_ACCESS_ID --access-type aws_iam 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                throw "Akeyless auth failed: $authOutput"
+            }
+            
+            # Extract token
+            $tokenMatch = $authOutput | Select-String -Pattern 'Token:\s+(\S+)'
+            if (-not $tokenMatch) {
+                throw "Could not extract Akeyless token from auth output"
+            }
+            $token = $tokenMatch.Matches[0].Groups[1].Value
+            
+            # Fetch dynamic secret with Azure credentials
+            $dsOutput = & $AkeylessExe dynamic-secret get-value --name "/DevOps/EvCodeSign/evcodesignservice" --token $token 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to fetch Akeyless dynamic secret: $dsOutput"
+            }
+            
+            # Parse credentials
+            $ds = $dsOutput | ConvertFrom-Json
+            $dsData = if ($ds.secret) { $ds.secret } else { $ds }
+            
+            if ([string]::IsNullOrWhiteSpace($dsData.tenantId) -or `
+                [string]::IsNullOrWhiteSpace($dsData.appId) -or `
+                [string]::IsNullOrWhiteSpace($dsData.secretText)) {
+                throw "Dynamic secret missing required Azure credentials"
+            }
+            
+            # Set Azure credentials
+            $env:AZURE_TENANT_ID = $dsData.tenantId
+            $env:AZURE_CLIENT_ID = $dsData.appId
+            $env:AZURE_CLIENT_SECRET = $dsData.secretText
+            
+            Write-Output "[OK] Azure credentials fetched from Akeyless inside container"
+            
+            # SECURITY: Clear sensitive variables after use
+            $token = $null
+            $authOutput = $null
+            $dsOutput = $null
+            
+        } catch {
+            Write-Error "Failed to fetch Azure credentials: $_"
+            exit 1
+        }
     }
-    
-    Write-Output "[OK] Azure credentials present"
     
     # Set OMNIBUS_AZURE_* environment variables for omnibus-private's windows_base.rb to use during signing
     if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
@@ -150,11 +225,16 @@ function Sign-ChefPackage {
         
         Write-Output "[OK] MSI signature is valid"
         
-        # Check if it's Progress EV certificate (should contain "Progress" in issuer)
-        if ($sig.SignerCertificate.Issuer -like "*Progress*") {
-            Write-Output "[OK] Signed with Progress EV certificate"
+        # Validate Progress EV certificate (issued by GlobalSign)
+        # Progress owns the certificate (Subject), GlobalSign issued it (Issuer)
+        if ($sig.SignerCertificate.Issuer -like "*GlobalSign*" -and `
+            $sig.SignerCertificate.Issuer -like "*EV*CodeSigning*" -and `
+            $sig.SignerCertificate.Subject -like "*PROGRESS*") {
+            Write-Output "[OK] Signed with Progress EV certificate (issued by GlobalSign)"
         } else {
-            Write-Warning "Certificate issuer does not contain 'Progress'. Issuer: $($sig.SignerCertificate.Issuer)"
+            Write-Warning "Certificate validation failed. Expected GlobalSign EV CodeSigning issuer with Progress subject."
+            Write-Warning "  Actual Issuer: $($sig.SignerCertificate.Issuer)"
+            Write-Warning "  Actual Subject: $($sig.SignerCertificate.Subject)"
         }
     }
     catch {
@@ -181,7 +261,7 @@ function Install-ChefFoundation {
             New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
         }
         
-        # Build MSI file URL and stops using old api and goes direct to packages.
+        # Build MSI file URL
         $msiUrl = "https://packages.chef.io/files/stable/chef-foundation/${Version}/windows/${WindowsVersion}/chef-foundation-${Version}-1-${Architecture}.msi"
         $msiFile = Join-Path $tempDir "chef-foundation-$Version.msi"
         
@@ -463,4 +543,35 @@ try {
 catch {
     Write-Error "Chef build pipeline failed: $_"
     exit 1
+}
+finally {
+    # Clean up sensitive environment variables for security
+    Write-Output "--- Cleaning up sensitive environment variables"
+    $sensitiveEnvVars = @(
+        'AZURE_TENANT_ID',
+        'AZURE_CLIENT_ID', 
+        'AZURE_CLIENT_SECRET',
+        'OMNIBUS_AZURE_KEY_VAULT_URL',
+        'OMNIBUS_AZURE_CERT_NAME',
+        'AWS_S3_ACCESS_KEY',
+        'AWS_S3_SECRET_KEY',
+        'ARTIFACTORY_PASSWORD',
+        'ARTIFACTORY_API_KEY',
+        'GITHUB_TOKEN',
+        'GEM_HOST_API_KEY'
+    )
+    
+    foreach ($var in $sensitiveEnvVars) {
+        if (Test-Path "env:\$var") {
+            Remove-Item -Path "env:\$var" -ErrorAction SilentlyContinue
+        }
+    }
+    
+    # Remove .netrc file if it exists
+    $netrcPath = "$env:USERPROFILE\_netrc"
+    if (Test-Path $netrcPath) {
+        Remove-Item $netrcPath -Force -ErrorAction SilentlyContinue
+    }
+    
+    Write-Output "[OK] Cleanup completed"
 }
