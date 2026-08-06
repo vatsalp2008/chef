@@ -229,9 +229,20 @@ function Ensure-DotNetRuntime {
     Write-Output "--- Ensuring .NET 8 runtime is available"
     
     try {
-        # Check if dotnet is already available
+        # Check if dotnet is already available and find its actual location
         $version = dotnet --version 2>&1 | Out-String
         Write-Output "[OK] .NET runtime already available: $version"
+        
+        # Find actual dotnet location and set DOTNET_ROOT correctly
+        # sign.exe uses DOTNET_ROOT to locate the .NET runtime
+        $dotnetCmd = Get-Command dotnet -ErrorAction SilentlyContinue
+        if ($dotnetCmd) {
+            $dotnetPath = $dotnetCmd.Source
+            $dotnetDir = Split-Path -Path $dotnetPath -Parent
+            Write-Output "Found dotnet at: $dotnetDir"
+            $env:DOTNET_ROOT = $dotnetDir
+            Write-Output "Set DOTNET_ROOT = $env:DOTNET_ROOT"
+        }
         return
     } catch {
         Write-Output "dotnet command not found, will attempt installation"
