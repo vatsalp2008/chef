@@ -73,6 +73,9 @@ function Initialize-ProgressSigning {
     if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -or `
         [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -or `
         [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
+        $tenantIdStatus = if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID)) { "NOT SET" } else { "SET" }
+        $clientIdStatus = if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)) { "NOT SET" } else { "SET" }
+        $secretStatus = if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) { "NOT SET" } else { "SET" }
         Write-Error @"
 Azure credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET) not found.
 
@@ -86,9 +89,9 @@ These env vars are then passed to Docker container for use by omnibus-private's
 windows_base.rb during MSI packaging and signing.
 
 Current state:
-  AZURE_TENANT_ID = $(if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID)) { "NOT SET" } else { "SET" })
-  AZURE_CLIENT_ID = $(if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)) { "NOT SET" } else { "SET" })
-  AZURE_CLIENT_SECRET = $(if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) { "NOT SET" } else { "SET" })
+  AZURE_TENANT_ID = $tenantIdStatus
+  AZURE_CLIENT_ID = $clientIdStatus
+  AZURE_CLIENT_SECRET = $secretStatus
 "@
         exit 1
     }
@@ -106,7 +109,6 @@ Current state:
     Write-Output "Progress EV signing will be handled by omnibus-private during MSI packaging"
     Write-Output "  OMNIBUS_AZURE_KEY_VAULT_URL = $env:OMNIBUS_AZURE_KEY_VAULT_URL"
     Write-Output "  OMNIBUS_AZURE_CERT_NAME = $env:OMNIBUS_AZURE_CERT_NAME"
-}
 }
 
 function Sign-ChefPackage {
