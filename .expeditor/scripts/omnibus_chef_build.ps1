@@ -250,6 +250,11 @@ function Install-OmnibusDependencies {
         Write-Output "--- Configuring Bundler for private repositories"
         bundle config set --local without development
 
+        # Set omnibus-private branch to progress-sign-for-msi (for Progress EV code signing)
+        Write-Output "--- Setting omnibus-private branch to progress-sign-for-msi/muthuja"
+        $env:OMNIBUS_GITHUB_BRANCH = "progress-sign-for-msi/muthuja"
+        Write-Output "  OMNIBUS_GITHUB_BRANCH = $env:OMNIBUS_GITHUB_BRANCH"
+
         # Navigate to omnibus directory
         Set-Location "$($ScriptDir)/../../omnibus"
         Write-Output "--- Running bundle install for Omnibus"
