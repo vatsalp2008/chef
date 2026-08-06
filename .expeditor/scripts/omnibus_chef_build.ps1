@@ -259,7 +259,7 @@ function Ensure-DotNetRuntime {
         $env:DOTNET_ROOT = $dotnetDir
         
         # Verify installation
-        $version = dotnet --version
+        $version = dotnet --version 2>&1 | Out-String
         Write-Output "[OK] .NET 8 runtime installed: $version"
     }
     catch {
