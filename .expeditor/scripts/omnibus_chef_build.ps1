@@ -222,6 +222,55 @@ function Install-ChefFoundation {
     }
 }
 
+function Ensure-DotNetRuntime {
+    [CmdletBinding()]
+    param()
+
+    try {
+        Write-Output "--- Ensuring .NET 8 runtime is available"
+        
+        # Check if dotnet is already available
+        $dotnetPath = $null
+        try {
+            $dotnetPath = (dotnet --version 2>&1) | Where-Object { $_ -match '8\.' }
+            if ($dotnetPath) {
+                Write-Output "✓ .NET runtime already available: $dotnetPath"
+                return
+            }
+        } catch {
+            Write-Output "dotnet command not found, will attempt installation"
+        }
+        
+        # Download and install .NET 8 runtime
+        Write-Output "Installing .NET 8 runtime..."
+        $dotnetInstallerUrl = "https://dot.net/v1/dotnet-install.ps1"
+        $dotnetInstallerPath = "$env:TEMP\dotnet-install.ps1"
+        
+        # Download installer
+        Invoke-WebRequest -Uri $dotnetInstallerUrl -OutFile $dotnetInstallerPath -ErrorAction Stop
+        
+        # Run installer for .NET 8
+        & $dotnetInstallerPath -Version "8.0" -InstallDir "$env:ProgramFiles\dotnet" -NoPath -ErrorAction Stop
+        
+        # Add to PATH
+        $dotnetDir = "$env:ProgramFiles\dotnet"
+        if ($env:PATH -notlike "*$dotnetDir*") {
+            $env:PATH = "$dotnetDir;$env:PATH"
+        }
+        
+        # Set DOTNET_ROOT for .NET tools
+        $env:DOTNET_ROOT = $dotnetDir
+        
+        # Verify installation
+        $version = dotnet --version
+        Write-Output "✓ .NET 8 runtime installed: $version"
+    }
+    catch {
+        Write-Warning "Failed to ensure .NET runtime: $_"
+        Write-Warning "Continuing anyway - sign tool may fail if .NET is not available"
+    }
+}
+
 function Install-OmnibusDependencies {
     [CmdletBinding()]
     param()
@@ -256,6 +305,9 @@ function Install-OmnibusDependencies {
         Write-Output "--- Setting omnibus-private branch to progress-sign-for-msi/muthuja"
         $env:OMNIBUS_GITHUB_BRANCH = "progress-sign-for-msi/muthuja"
         Write-Output "  OMNIBUS_GITHUB_BRANCH = $env:OMNIBUS_GITHUB_BRANCH"
+
+        # Ensure .NET 8 runtime is available (needed for sign tool used during MSI packaging)
+        Ensure-DotNetRuntime
 
         # Navigate to omnibus directory
         Set-Location "$($ScriptDir)/../../omnibus"
