@@ -68,249 +68,96 @@ function Initialize-ProgressSigning {
 
     Write-Output "--- Initializing Progress EV code signing"
     
-    Write-Output "Checking required signing tools (pre-installed in Docker image)"
-    
-    # Search for tools in common locations and add to PATH
-    $toolSearchPaths = @(
-        "C:\Program Files\dotnet",
-        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin",
-        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\Scripts",
-        "C:\opscode\omnibus-toolchain\bin",
-        "C:\opscode\omnibus-toolchain\embedded\bin",
-        "C:\Users\$env:USERNAME\AppData\Local\Programs\Python\Python*\Scripts",
-        "$env:USERPROFILE\.dotnet\tools",
-        "$env:LocalAppData\Programs\Akeyless",
-        "C:\Akeyless"
-    )
-    
-    Write-Output "Searching for tools in:"
-    foreach ($searchPath in $toolSearchPaths) {
-        if (Test-Path $searchPath) {
-            Write-Output "  Found: $searchPath"
-            if ($env:PATH -notlike "*$searchPath*") {
-                $env:PATH = "$searchPath;$env:PATH"
-            }
-        }
-    }
-    
-    # Search for az.exe specifically
-    Write-Output "Locating Azure CLI..."
-    $azPaths = @(
-        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\wbin\az.exe",
-        "C:\Program Files (x86)\Microsoft SDKs\Azure\CLI2\Scripts\az.bat"
-    )
-    foreach ($path in $azPaths) {
-        if (Test-Path $path) {
-            Write-Output "  Found Azure CLI at: $path"
-            $azDir = Split-Path $path
-            if ($env:PATH -notlike "*$azDir*") {
-                $env:PATH = "$azDir;$env:PATH"
-            }
-            break
-        }
-    }
-    
-    # Verify dotnet is available
-    Write-Output "Verifying dotnet SDK..."
-    if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
-        Write-Error "dotnet SDK not found in PATH"
-        exit 1
-    }
-    Write-Output "[OK] dotnet: $(dotnet --version)"
-    
-    # Check available .NET runtimes (sign tool may need a specific runtime)
-    Write-Output "Checking available .NET runtimes..."
-    $runtimes = dotnet --list-runtimes 2>&1
-    if ($runtimes) {
-        $runtimes | ForEach-Object { Write-Output "  $_" }
-    } else {
-        Write-Warning "No .NET runtimes detected (this may cause sign tool to fail)"
-    }
-    
-    Write-Output "Checking available .NET SDKs..."
-    $sdks = dotnet --list-sdks 2>&1
-    if ($sdks) {
-        $sdks | ForEach-Object { Write-Output "  $_" }
-    }
-    
-    # Verify sign tool is available (pre-installed in Docker)
-    Write-Output "Verifying sign tool..."
-    if (-not (Get-Command sign -ErrorAction SilentlyContinue)) {
-        Write-Error "sign tool not found in PATH. Tools should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
-        Write-Error "Current PATH:"
-        $env:PATH -split ';' | ForEach-Object { Write-Error "  $_" }
-        exit 1
-    }
-    
-    # Try to get sign version (may fail if .NET runtime is missing)
-    Write-Output "Getting sign tool version..."
-    try {
-        $signVersion = sign --version 2>&1
-        Write-Output "[OK] sign tool: $signVersion"
-    } catch {
-        Write-Error "Failed to run sign tool: $_"
-        Write-Error "This may be due to missing .NET runtime. Available runtimes:"
-        dotnet --list-runtimes 2>&1 | ForEach-Object { Write-Error "  $_" }
-        exit 1
-    }
-    
-    # Verify Azure CLI is available (pre-installed in Docker)
-    Write-Output "Verifying Azure CLI..."
-    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        Write-Error "Azure CLI not found. Should be pre-installed in Docker image chefes/omnibus-toolchain-windows-2019:3.0.39"
-        exit 1
-    }
-    Write-Output "[OK] Azure CLI: $(az --version 2>&1 | Select-Object -First 1)"
-    
-    # Verify Akeyless CLI is available (pre-installed in Docker)
-    Write-Output "Verifying Akeyless CLI..."
-    if (-not (Get-Command akeyless -ErrorAction SilentlyContinue)) {
-        Write-Warning "Akeyless CLI not found (may not be needed for Chef-18 as credentials pre-fetched)"
-    } else {
-        Write-Output "[OK] Akeyless CLI: $(akeyless --version 2>&1 | Select-Object -First 1)"
-    }
+    # Check if Azure credentials already initialized (pre-fetched on host via .buildkite/hooks/pre-command)
+    # These are passed to Docker as environment variables
+    if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -or `
+        [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -or `
+        [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
+        Write-Error @"
+Azure credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET) not found.
 
-    Write-Output "--- Checking Progress EV code signing credentials"
+These must be pre-fetched on the Windows host via .buildkite/hooks/pre-command:
+  1. Fetch AKEYLESS_ACCESS_ID from AWS Parameter Store
+  2. Authenticate to Akeyless with AWS IAM
+  3. Get dynamic secret from /DevOps/EvCodeSign/evcodesignservice
+  4. Export AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
 
-    # Check if Azure credentials already initialized (pre-fetched on host, passed via env or .omnibus-buildkite-plugin/build-settings.ps1)
-    if (-not [string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID) -and `
-        -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID) -and `
-        -not [string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) {
-        Write-Output "Azure credentials already initialized"
-        if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
-            $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
-        }
-        if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_CERT_NAME)) {
-            $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
-        }
-        Write-Output "[OK] Using pre-initialized Azure credentials"
-        return
-    }
+These env vars are then passed to Docker container for use by omnibus-private's
+windows_base.rb during MSI packaging and signing.
 
-    # Credentials not pre-initialized
-    # For Chef-18: Credentials should be pre-fetched on host (Windows 2019 agent) 
-    # via chef/.buildkite/hooks/pre-command and passed as env vars
-    Write-Error @"
-Azure credentials (AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET) are not initialized.
-
-For Chef-18 builds, Progress EV credentials must be pre-fetched on the Windows host
-and passed to the Docker container as environment variables.
-
-This should happen in chef/.buildkite/hooks/pre-command hook which:
-1. Detects build-windows step
-2. Fetches AKEYLESS_ACCESS_ID from AWS Parameter Store
-3. Authenticates to Akeyless (aws_iam)
-4. Fetches dynamic secret with Azure credentials
-5. Exports AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
-
-For debugging:
-- Check that chef/.buildkite/hooks/pre-command ran successfully
-- Verify Akeyless CLI and AWS CLI are available on the host (Windows 2019 agent)
-- Ensure EC2 instance IAM role has ssm:GetParameter permission
-- Check that Docker receives the AZURE_* environment variables
+Current state:
+  AZURE_TENANT_ID = $(if ([string]::IsNullOrWhiteSpace($env:AZURE_TENANT_ID)) { "NOT SET" } else { "SET" })
+  AZURE_CLIENT_ID = $(if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_ID)) { "NOT SET" } else { "SET" })
+  AZURE_CLIENT_SECRET = $(if ([string]::IsNullOrWhiteSpace($env:AZURE_CLIENT_SECRET)) { "NOT SET" } else { "SET" })
 "@
-    exit 1
+        exit 1
+    }
+    
+    Write-Output "[OK] Azure credentials present"
+    
+    # Set OMNIBUS_AZURE_* environment variables for omnibus-private's windows_base.rb to use during signing
+    if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_KEY_VAULT_URL)) {
+        $env:OMNIBUS_AZURE_KEY_VAULT_URL = "https://caps-evcodesign-useast.vault.azure.net"
+    }
+    if ([string]::IsNullOrWhiteSpace($env:OMNIBUS_AZURE_CERT_NAME)) {
+        $env:OMNIBUS_AZURE_CERT_NAME = "psc-evcodesign"
+    }
+    
+    Write-Output "Progress EV signing will be handled by omnibus-private during MSI packaging"
+    Write-Output "  OMNIBUS_AZURE_KEY_VAULT_URL = $env:OMNIBUS_AZURE_KEY_VAULT_URL"
+    Write-Output "  OMNIBUS_AZURE_CERT_NAME = $env:OMNIBUS_AZURE_CERT_NAME"
+}
 }
 
 function Sign-ChefPackage {
     [CmdletBinding()]
     param()
     
+    Write-Output "--- Verifying Chef MSI signature (signed by omnibus-private during build)"
+    
     try {
-        Write-Output "--- Signing Chef MSI"
+        # Find MSI file in omnibus package directory
+        $msiPath = Get-ChildItem -Path "C:\omnibus-ruby\chef\pkg\" -Filter "*.msi" -ErrorAction SilentlyContinue | Select-Object -First 1
         
-        $msiPath = Get-ChildItem -Path "C:\omnibus-ruby\chef\pkg\" -Filter *.msi | Select-Object -First 1
         if (-not $msiPath) {
-            throw "No MSI file found in C:\omnibus-ruby\chef\pkg\"
+            Write-Warning "No MSI file found in C:\omnibus-ruby\chef\pkg\ - packaging may have been skipped"
+            return
         }
         
         $msiPath = $msiPath.FullName
-        Write-Output "MSI file: $msiPath"
+        Write-Output "Found MSI: $(Split-Path $msiPath -Leaf)"
         
-        # Azure login
-        Write-Output "Azure login (service principal)"
-        for ($attempt = 1; $attempt -le 5; $attempt++) {
-            az login --service-principal `
-                --username $env:AZURE_CLIENT_ID `
-                --password $env:AZURE_CLIENT_SECRET `
-                --tenant $env:AZURE_TENANT_ID `
-                --output none 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) { break }
-            if ($attempt -lt 5) {
-                Write-Output "  Attempt $attempt/5 failed, retrying in 15s..."
-                Start-Sleep -Seconds 15
-            }
-        }
-        if ($LASTEXITCODE -ne 0) {
-            throw "az login failed after 5 attempts"
-        }
-        Write-Output "[OK] Azure login successful"
-        
-        # Sign MSI using sign tool (Progress EV Code Signing)
-        Write-Output "Signing MSI with sign tool"
-        $keyVaultUrl = $env:OMNIBUS_AZURE_KEY_VAULT_URL
-        $certificateName = $env:OMNIBUS_AZURE_CERT_NAME
-        $timestampServers = @(
-            "http://timestamp.acs.microsoft.com/",
-            "http://timestamp.globalsign.com/tsa/r45standard",
-            "http://ts.ssl.com/",
-            "http://timestamp.digicert.com"
-        )
-        
-        $signed = $false
-        try {
-            foreach ($ts in $timestampServers) {
-                Write-Output "  Trying timestamp server: $ts"
-                & sign code azure-key-vault "$msiPath" `
-                    -d "Chef" `
-                    -u "https://www.chef.io" `
-                    -kvu $keyVaultUrl `
-                    -kvc $certificateName `
-                    -fd sha256 `
-                    -td sha256 `
-                    -t $ts 2>&1
-                if ($LASTEXITCODE -eq 0) {
-                    Write-Output "[OK] Signed successfully using timestamp server: $ts"
-                    $signed = $true
-                    break
-                }
-                Write-Output "  Timestamp server $ts failed, trying next..."
-            }
-        } finally {
-            # Always clear credential env vars regardless of signing outcome
-            Remove-Item Env:AZURE_TENANT_ID -ErrorAction SilentlyContinue
-            Remove-Item Env:AZURE_CLIENT_ID -ErrorAction SilentlyContinue
-            Remove-Item Env:AZURE_CLIENT_SECRET -ErrorAction SilentlyContinue
-        }
-        
-        if (-not $signed) {
-            throw "Signing failed with all timestamp servers"
-        }
-        
-        # Verify signature
-        Write-Output "Verifying signature"
+        # Verify signature (omnibus-private should have signed this during packaging)
+        Write-Output "Verifying signature..."
         $sig = Get-AuthenticodeSignature -FilePath $msiPath
+        
         Write-Output "  Status: $($sig.Status)"
         Write-Output "  Subject: $($sig.SignerCertificate.Subject)"
+        Write-Output "  Issuer: $($sig.SignerCertificate.Issuer)"
         Write-Output "  Valid From: $($sig.SignerCertificate.NotBefore)"
         Write-Output "  Valid To: $($sig.SignerCertificate.NotAfter)"
+        Write-Output "  Thumbprint: $($sig.SignerCertificate.Thumbprint)"
         
         if ($sig.Status -ne 'Valid') {
-            throw "Signature verification failed: $($sig.Status)"
+            Write-Error "Signature verification failed: $($sig.Status)"
+            if ($sig.StatusMessage) {
+                Write-Error "  Details: $($sig.StatusMessage)"
+            }
+            exit 1
         }
-        Write-Output "[OK] Signature is valid"
+        
+        Write-Output "[OK] MSI signature is valid"
+        
+        # Check if it's Progress EV certificate (should contain "Progress" in issuer)
+        if ($sig.SignerCertificate.Issuer -like "*Progress*") {
+            Write-Output "[OK] Signed with Progress EV certificate"
+        } else {
+            Write-Warning "Certificate issuer does not contain 'Progress'. Issuer: $($sig.SignerCertificate.Issuer)"
+        }
     }
     catch {
-        Write-Error "Signing failed: $_"
+        Write-Error "Failed to verify MSI signature: $_"
         exit 1
-    }
-    finally {
-        # Cleanup credentials
-        Remove-Item Env:AZURE_TENANT_ID -ErrorAction SilentlyContinue
-        Remove-Item Env:AZURE_CLIENT_ID -ErrorAction SilentlyContinue
-        Remove-Item Env:AZURE_CLIENT_SECRET -ErrorAction SilentlyContinue
-        az logout 2>&1 | Out-Null
-        Write-Output "Credentials cleared"
     }
 }
 
